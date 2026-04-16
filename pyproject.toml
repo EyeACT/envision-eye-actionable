@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "envision-eye-actionable"
+version = "0.1.0"
+description = "ADDF conformer for eye imaging datasets — turns raw downloaded archives into ADDF v0.1.0 trees ready for training"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "James O'Neill"}
+]
+keywords = [
+    "eye imaging", "ophthalmology", "ADDF", "AI-READI",
+    "dataset curation", "machine-actionable", "EyeACT",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+requires-python = ">=3.10"
+
+# Core deps: readers needed for any conform run.
+dependencies = [
+    # Standard / open medical formats
+    "pydicom>=2.4",
+    "nibabel>=5.0",
+    "h5py>=3.0",
+    "mat73>=0.65",
+    "scipy>=1.10",
+    "tifffile>=2024.1",
+    "pynrrd>=1.0",
+    "SimpleITK>=2.3",
+    # Docs / labels
+    "pypdf>=4.0",
+    "pdfplumber>=0.11",
+    "python-docx>=1.0",
+    # Images
+    "Pillow>=10.0",
+    "imageio>=2.33",
+    # Vendor OCT (proprietary-format readers)
+    "oct-converter>=0.6",
+    # Archive handling (zip built-in, these are for the less common ones)
+    "py7zr>=0.21",
+    "rarfile>=4.1",
+    # Data wrangling
+    "pandas>=2.0.0",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+# Local LLM agent fallback (Gemma 4 via llama.cpp). Optional because it's a
+# heavy dep chain and the rule-based sniffer often suffices.
+agent = [
+    "llama-cpp-python>=0.3",
+]
+
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/EyeACT/envision-eye-actionable"
+Repository = "https://github.com/EyeACT/envision-eye-actionable"
+"Related: envision-discovery" = "https://github.com/EyeACT/envision-discovery"
+"EyeACT" = "https://github.com/EyeACT"
+
+[project.scripts]
+envision-conform = "envision_eye_actionable.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["envision_eye_actionable*"]
