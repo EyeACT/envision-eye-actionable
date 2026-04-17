@@ -140,19 +140,18 @@ def _rule_paired_image_mask(inv: Inventory) -> Recipe | None:
     )
 
 
-def _rule_modality_bucket(inv: Inventory) -> Recipe | None:
+def _rule_modality_bucket(inv: Inventory) -> Recipe:
     """Catch-all: bucket files by detected modality.
 
-    Always works, but low confidence — a fallback before the agent step.
+    Always returns a recipe — even when nothing is recognizable — so
+    sniff() never returns None. Confidence drops to 0.2 when we couldn't
+    find any readable modality; the agent pass should pick that up.
     """
     by_modality = defaultdict(list)
     for f in inv.files:
-        if f.modality in ("other", "documentation", "metadata"):
+        if f.modality in ("other", "documentation", "metadata", "archive_fragment"):
             continue
         by_modality[f.modality].append(f)
-
-    if not by_modality:
-        return None
 
     placements = []
     for mod, files in sorted(by_modality.items()):
@@ -172,11 +171,38 @@ def _rule_modality_bucket(inv: Inventory) -> Recipe | None:
             directory_type="dataType",
         ))
 
+    # Archive fragments — leftover multi-part pieces that weren't successfully
+    # reassembled. Park them under _unreassembled/ so they aren't silently
+    # treated as data files.
+    frag_files = [f for f in inv.files if f.modality == "archive_fragment"]
+    if frag_files:
+        placements.append(Placement(
+            glob=_common_dir_glob(frag_files),
+            addf_dir="_unreassembled",
+            modality="archive_fragment", role="raw",
+            directory_type="dataType",
+        ))
+
+    if not by_modality and not doc_files and not frag_files:
+        # Nothing placeable at all — emit a bare recipe so callers don't crash.
+        return Recipe(
+            task_type="raw",
+            placements=[],
+            confidence=0.1,
+            notes=["No placeable files detected; needs agent or manual review"],
+        )
+
+    confidence = 0.5 if by_modality else 0.2
+    notes = []
+    if by_modality:
+        notes.append(f"Bucketed by detected modality ({', '.join(by_modality)})")
+    if frag_files:
+        notes.append(f"{len(frag_files)} archive fragment(s) parked under _unreassembled/")
     return Recipe(
         task_type="raw",
         placements=placements,
-        confidence=0.5,
-        notes=[f"Bucketed by detected modality ({', '.join(by_modality)})"],
+        confidence=confidence,
+        notes=notes,
     )
 
 

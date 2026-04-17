@@ -70,6 +70,17 @@ FORMAT_TABLE: dict[str, tuple[str, str, bool]] = {
     ".xml":   ("xml",        "metadata",            True),
     ".yaml":  ("yaml",       "metadata",            True),
     ".yml":   ("yaml",       "metadata",            True),
+
+    # Leftover multi-part archive fragments (shouldn't be placed as data)
+    ".part":  ("none",       "archive_fragment",    False),
+    **{
+        f".z{i:02d}": ("none", "archive_fragment", False)
+        for i in range(1, 100)  # .z01..z99
+    },
+    **{
+        f".r{i:02d}": ("none", "archive_fragment", False)
+        for i in range(0, 100)  # .r00..r99 (split RAR)
+    },
 }
 
 README_NAMES = {"readme.md", "readme.txt", "readme", "readme.rst"}

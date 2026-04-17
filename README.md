@@ -5,9 +5,13 @@ data. Produces ADDF v0.1.0 compliant directory trees with per-modality
 subdirectories, MeSH/NCIT ontology tags, and validated file layouts that can
 be fed directly to `datasets.load_dataset(...)` or any ML training loop.
 
-Part of the [EyeACT](https://github.com/EyeACT) project — which aims to make
-eye imaging datasets across the scientific literature discoverable,
-classifiable, and directly usable for ML/AI research.
+Part of the [EyeACT](https://github.com/EyeACT) (Eye Aging, Cognition, and
+Imaging) project by the [FAIR Data Innovations Hub](https://fairdataihub.org)
+at the [California Medical Innovations Institute (CalMI2)](https://calmi2.org).
+
+EyeACT aims to make eye imaging datasets across the scientific literature
+discoverable, classifiable, and directly usable for ML/AI research. Discovered
+datasets are registered on the [Envision Portal](https://envisionportal.org).
 
 ## Where this sits in the pipeline
 
@@ -66,6 +70,11 @@ envision-conform --all-sources
 
 # Enable the Gemma 4 agent fallback for low-confidence layouts
 envision-conform --source zenodo --agent-model ~/models/gemma-4-e4b-it-q4.gguf
+
+# Re-run only records that need the agent (after a first pass)
+envision-conform --source zenodo \
+    --rerun-status agent_needed,failed \
+    --agent-model ~/models/gemma-4-e4b-it-q4.gguf
 
 # Custom input/output paths (if not running next to an envision-discovery checkout)
 envision-conform --source zenodo \
@@ -156,12 +165,36 @@ If you're not running this alongside an envision-discovery checkout, use
   as subdirectories; the conformer passes them through but doesn't tag them.
 - **Cross-source deduplication** — that lives upstream in envision-discovery.
 
+## Results (Zenodo, first run)
+
+Applied to 83 downloaded Zenodo eye imaging datasets (644 GB):
+
+| Pass | ok | agent_needed | failed |
+|------|-----|-------------|--------|
+| Rule-based only | 16 (19%) | 60 (72%) | 7 (9%) |
+| + Gemma 4 E4B agent | **82 (99%)** | 1 (1%) | 0 (0%) |
+
+The agent (running locally on CPU via llama.cpp, Q4_K_M quantization) upgraded
+66 of 67 non-ok records to `ok` with validated ADDF trees. Zero failures on the
+re-run.
+
 ## Related
 
 - [envision-discovery](https://github.com/EyeACT/envision-discovery) — dataset scraping + classification + download pipeline
 - [envision-classifier](https://github.com/EyeACT/envision-classifier) — the SetFit eye-imaging classifier
+- [Model weights on HuggingFace](https://huggingface.co/fairdataihub/envision-eye-imaging-classifier)
+- [Envision Portal](https://envisionportal.org) — searchable catalog of discovered eye imaging datasets
 - [ADDF schema (AI-READI)](https://schema.aireadi.org/v0.1.0/)
-- [EyeACT](https://github.com/EyeACT) — project home
+- [EyeACT Study](https://eyeactstudy.org) — Eye Aging, Cognition, and Imaging study
+- [FAIR Data Innovations Hub](https://fairdataihub.org)
+
+## Citation
+
+If you use this tool in your research, please cite the EyeACT project:
+
+> FAIR Data Innovations Hub, California Medical Innovations Institute (CalMI2).
+> *Envision: Eye imaging dataset discovery and curation pipeline.*
+> EyeACT Study, [eyeactstudy.org](https://eyeactstudy.org).
 
 ## License
 
