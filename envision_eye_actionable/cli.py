@@ -4,21 +4,18 @@ envision-eye-actionable CLI.
 Defaults target envision-discovery's directory layout:
   ./data/downloads/{source}/{source_id}/   — downloaded files
   ./results/{source}_eye_imaging.json      — classification metadata (optional)
-  ./data/actionable/{source}/{source_id}/  — conformed ADDF output
+  ./data/actionable/{source}/{source_id}/  — conformed output
 
 Examples:
 
     # Conform every downloaded zenodo record
-    envision-conform --source zenodo
+    envision-conform --agent-model ~/models/gemma-4-e4b-it-q4.gguf --source zenodo
 
     # One specific record
-    envision-conform --source zenodo --source-id 4521044
+    envision-conform --agent-model ~/models/gemma-4-e4b-it-q4.gguf --source zenodo --source-id 4521044
 
     # Every source under ./data/downloads/
-    envision-conform --all-sources
-
-    # Enable the Gemma 4 agent fallback
-    envision-conform --source zenodo --agent-model ~/models/gemma-4-e4b-it-q4.gguf
+    envision-conform --agent-model ~/models/gemma-4-e4b-it-q4.gguf --all-sources
 """
 
 from __future__ import annotations
@@ -35,7 +32,11 @@ from .agent import AgentConfig
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="envision-conform",
-        description="ADDF conformer for eye imaging datasets (envision-eye-actionable)",
+        description="Conformer for eye imaging datasets — AI-READI schema (envision-eye-actionable)",
+    )
+    parser.add_argument(
+        "--agent-model", required=True,
+        help="Path to a Gemma 4 GGUF model (e.g. ~/models/gemma-4-e4b-it-q4.gguf)",
     )
     parser.add_argument(
         "--source", default="zenodo",
@@ -55,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--output-dir", default="./data/actionable",
-        help="Root for conformed ADDF trees (default: ./data/actionable)",
+        help="Root for conformed output trees (default: ./data/actionable)",
     )
     parser.add_argument(
         "--results-dir", default="./results",
@@ -67,13 +68,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Copy files instead of hardlinking (portable across filesystems, uses 2x disk)",
     )
     parser.add_argument(
-        "--agent-model",
-        help="Path to a Gemma 4 GGUF for agent fallback on low-confidence layouts",
-    )
-    parser.add_argument(
         "--rerun-status", default=None,
         help="Re-conform only records whose previous status matches one of these "
-             "(comma-separated, e.g. 'agent_needed,failed'). Reads _conform_log.json "
+             "(comma-separated, e.g. 'failed'). Reads _conform_log.json "
              "under --output-dir/{source}/.",
     )
 
@@ -83,9 +80,7 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = Path(args.output_dir)
     results_dir = Path(args.results_dir) if args.results_dir else None
 
-    agent_config: AgentConfig | None = None
-    if args.agent_model:
-        agent_config = AgentConfig(model_path=Path(args.agent_model).expanduser())
+    agent_config = AgentConfig(model_path=Path(args.agent_model).expanduser())
 
     # Mode: --all-sources
     if args.all_sources:
@@ -123,8 +118,8 @@ def main(argv: list[str] | None = None) -> int:
             source_id=args.source_id,
             downloaded_dir=record_dir,
             target_root=output_dir,
-            source_metadata=_load_record_metadata(args.source, args.source_id, results_dir),
             agent_config=agent_config,
+            source_metadata=_load_record_metadata(args.source, args.source_id, results_dir),
             copy=args.copy,
         )
         print(
@@ -144,7 +139,7 @@ def _rerun_by_status(
     downloads_dir: Path,
     output_dir: Path,
     results_dir: Path | None,
-    agent_config: AgentConfig | None,
+    agent_config: AgentConfig,
     copy: bool,
 ) -> int:
     """Re-conform only records whose previous status is in ``wanted``."""
@@ -165,8 +160,6 @@ def _rerun_by_status(
         return 0
 
     print(f"Re-conforming {len(to_rerun)} {source} record(s) with status in {wanted}",
-          flush=True)
-    print(f"  agent enabled: {agent_config is not None and agent_config.model_path}",
           flush=True)
 
     before_counts: dict[str, int] = {}
@@ -190,8 +183,8 @@ def _rerun_by_status(
                 source_id=sid,
                 downloaded_dir=record_dir,
                 target_root=output_dir,
-                source_metadata=_load_record_metadata(source, sid, results_dir),
                 agent_config=agent_config,
+                source_metadata=_load_record_metadata(source, sid, results_dir),
                 copy=copy,
             )
             print(f"    status={result.status}  confidence={result.recipe_confidence:.2f}"
@@ -220,8 +213,7 @@ def _rerun_by_status(
 
     for r in log["records"]:
         after_counts[r.get("status", "?")] = after_counts.get(r.get("status", "?"), 0) + 1
-    log["summary"] = {k: after_counts.get(k, 0) for k in
-                      ("ok", "agent_needed", "failed")}
+    log["summary"] = {k: after_counts.get(k, 0) for k in ("ok", "failed")}
     log["last_rerun"] = {"wanted": sorted(wanted), "count": len(to_rerun)}
 
     with open(log_path, "w") as f:
@@ -238,7 +230,7 @@ def _run_source(
     downloads_dir: Path,
     output_dir: Path,
     results_dir: Path | None,
-    agent_config: AgentConfig | None,
+    agent_config: AgentConfig,
     copy: bool,
 ) -> int:
     source_dir = downloads_dir / source
@@ -262,8 +254,8 @@ def _run_source(
         source=source,
         downloads_root=downloads_dir,
         target_root=output_dir,
-        eye_imaging_results=eye_imaging_results,
         agent_config=agent_config,
+        eye_imaging_results=eye_imaging_results,
         copy=copy,
     )
     return 0

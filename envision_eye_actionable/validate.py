@@ -1,4 +1,4 @@
-"""Validate a materialized ADDF tree.
+"""Validate a materialized directory tree.
 
 Two checks:
   1. The emitted dataset_structure_description.json is self-consistent —

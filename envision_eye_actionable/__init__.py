@@ -1,21 +1,21 @@
 """
-envision-eye-actionable — ADDF conformer for eye imaging datasets.
+envision-eye-actionable — conformer for eye imaging datasets.
 
 Turns raw downloaded archives (from envision-discovery or any other source)
-into ADDF v0.1.0 on-disk trees that a downstream loader can consume.
+into structured directory trees following the AI-READI dataset description
+schema (v0.1.0) that HuggingFace loaders and ML training loops can consume.
 
 Flow per record:
     unpack      → extract every archive recursively
     inventory   → walk tree, classify each file by format/modality/readability
-    sniff       → rule-based layout matcher (ImageFolder, paired masks, ...)
-    agent       → optional Gemma-4 E4B fallback for unusual layouts
-    materialize → hardlink files into an ADDF directoryList tree
+    agent       → Gemma 4 E4B proposes a placement recipe from inventory + README + metadata
+    materialize → hardlink files into the target directory tree
     validate    → sample-open one file per modality with the right reader
 
 Default inputs:  ./data/downloads/{source}/{source_id}/  (envision-discovery layout)
 Default outputs: ./data/actionable/{source}/{source_id}/
 
-Part of the EyeACT project.
+Part of the EyeACT project by the FAIR Data Innovations Hub at CalMI2.
 """
 
 from .pipeline import conform_record, conform_source

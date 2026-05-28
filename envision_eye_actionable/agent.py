@@ -1,14 +1,11 @@
-"""Agent fallback via local Gemma 4 E4B (llama.cpp).
+"""Agent-based recipe generation via local Gemma 4 E4B (llama.cpp).
 
-When the rule-based sniffer returns a low-confidence Recipe, this module
-asks a local LLM to propose one from the inventory + README + scraped
-metadata. Runs on CPU, no API calls.
+Given an inventory of unpacked files plus optional README text and scraped
+metadata, asks a local LLM to propose an ADDF placement recipe.
+Runs on CPU, no API calls.
 
-Install (optional — only needed when using the agent):
+Install:
     pip install envision-eye-actionable[agent]
-
-Then pass ``--agent-model <path-to-gguf>`` to ``envision-conform`` or pass
-``AgentConfig(model_path=...)`` programmatically.
 
 Recommended model: `gemma-4-E4B-it-Q4_K_M.gguf` from
 https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF (~5 GB, 5-15 tok/s on CPU).
@@ -23,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .inventory import Inventory, sample_text
-from .sniff import Placement, Recipe
+from .recipe import Placement, Recipe
 
 logger = logging.getLogger(__name__)
 

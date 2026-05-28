@@ -1,6 +1,6 @@
 """Top-level conformer pipeline.
 
-Orchestrates: unpack → inventory → sniff → (agent) → materialize → validate.
+Orchestrates: unpack → inventory → agent → materialize → validate.
 """
 
 from __future__ import annotations
@@ -13,20 +13,17 @@ from pathlib import Path
 
 from . import agent as agent_mod
 from . import materialize as mat_mod
-from . import sniff as sniff_mod
 from . import unpack as unpack_mod
 from . import validate as validate_mod
 from .inventory import inventory_tree
 
 logger = logging.getLogger(__name__)
 
-AGENT_CONFIDENCE_FLOOR = 0.7  # below this, try the agent
-
 
 @dataclass
 class ConformResult:
     source_id: str
-    status: str                # "ok", "agent_needed", "failed"
+    status: str                # "ok" or "failed"
     recipe_confidence: float
     report_path: Path | None
     validation: dict | None
@@ -37,8 +34,8 @@ def conform_record(
     source_id: str,
     downloaded_dir: Path,
     target_root: Path,
+    agent_config: agent_mod.AgentConfig,
     source_metadata: dict | None = None,
-    agent_config: agent_mod.AgentConfig | None = None,
     copy: bool = False,
     tmp_unpack_dir: Path | None = None,
 ) -> ConformResult:
@@ -49,8 +46,8 @@ def conform_record(
         source_id: e.g. "14926762".
         downloaded_dir: data/downloads/{source}/{source_id}/.
         target_root: base for conformed output; record lands at target_root/{source}/{source_id}/.
+        agent_config: AgentConfig with the path to the local GGUF model.
         source_metadata: optional classification result dict (title/desc/keywords).
-        agent_config: if provided AND sniff confidence is low, call the agent.
         copy: if True, copy files instead of hardlinking.
         tmp_unpack_dir: override for the unpack scratch dir.
 
@@ -70,16 +67,18 @@ def conform_record(
         # 2) Inventory
         inv = inventory_tree(unpacked_root)
 
-        # 3) Sniff
-        recipe = sniff_mod.sniff(inv)
+        # 3) Agent proposes a recipe
+        recipe = agent_mod.propose_recipe(inv, source_metadata, agent_config)
+        if recipe is None:
+            return ConformResult(
+                source_id=source_id,
+                status="failed",
+                recipe_confidence=0.0,
+                report_path=None,
+                validation={"ok": False, "error": "Agent returned no recipe"},
+            )
 
-        # 4) Optional agent fallback (stub for now)
-        if recipe.confidence < AGENT_CONFIDENCE_FLOOR and agent_config is not None:
-            agent_recipe = agent_mod.propose_recipe(inv, source_metadata, agent_config)
-            if agent_recipe is not None:
-                recipe = agent_recipe
-
-        # 5) Materialize
+        # 4) Materialize
         report = mat_mod.materialize(
             inv, recipe,
             source_root=unpacked_root,
@@ -87,12 +86,10 @@ def conform_record(
             copy=copy,
         )
 
-        # 6) Validate
+        # 5) Validate
         validation = validate_mod.validate_tree(out_dir)
 
-    status = "ok" if validation.get("ok") and recipe.confidence >= AGENT_CONFIDENCE_FLOOR else "agent_needed"
-    if not validation.get("ok"):
-        status = "failed"
+    status = "ok" if validation.get("ok") else "failed"
 
     return ConformResult(
         source_id=source_id,
@@ -107,8 +104,8 @@ def conform_source(
     source: str,
     downloads_root: Path,
     target_root: Path,
+    agent_config: agent_mod.AgentConfig,
     eye_imaging_results: list[dict] | None = None,
-    agent_config: agent_mod.AgentConfig | None = None,
     copy: bool = False,
 ) -> list[ConformResult]:
     """Conform every downloaded record under downloads_root/{source}/."""
@@ -132,8 +129,8 @@ def conform_source(
                 source_id=sid,
                 downloaded_dir=rec_dir,
                 target_root=target_root,
-                source_metadata=meta_by_id.get(sid),
                 agent_config=agent_config,
+                source_metadata=meta_by_id.get(sid),
                 copy=copy,
             )
             print(f"    status={result.status}  confidence={result.recipe_confidence:.2f}"
@@ -150,10 +147,8 @@ def conform_source(
 
     # Summary
     ok = sum(1 for r in results if r.status == "ok")
-    agent = sum(1 for r in results if r.status == "agent_needed")
     failed = sum(1 for r in results if r.status == "failed")
-    print(f"\n  Conform summary [{source}]: "
-          f"{ok} ok, {agent} need agent, {failed} failed", flush=True)
+    print(f"\n  Conform summary [{source}]: {ok} ok, {failed} failed", flush=True)
 
     # Write top-level run log
     log_path = target_root / source / "_conform_log.json"
@@ -170,7 +165,7 @@ def conform_source(
                 }
                 for r in results
             ],
-            "summary": {"ok": ok, "agent_needed": agent, "failed": failed},
+            "summary": {"ok": ok, "failed": failed},
         }, f, indent=2)
 
     return results

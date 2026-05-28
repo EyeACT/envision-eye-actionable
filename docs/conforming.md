@@ -1,32 +1,31 @@
-# ADDF Conformer
+# Conformer
 
 Turns raw downloaded archives (e.g. from [envision-discovery](https://github.com/EyeACT/envision-discovery)'s
-`--download` step) into ADDF v0.1.0 compliant directory trees. Output lands
-in `data/actionable/{source}/{source_id}/` with a `dataset_structure_description.json`
-that describes the layout.
+`--download` step) into structured directory trees following the
+[AI-READI dataset description schema](https://schema.aireadi.org/v0.1.0/) (v0.1.0).
+Output lands in `data/actionable/{source}/{source_id}/` with a
+`dataset_structure_description.json` that describes the layout.
 
 ## Pipeline
 
 ```
 downloaded record
-      │
-      ▼
+      |
+      v
    unpack    extract every .zip/.tar/.7z/.rar/multi-part zip (recursive)
-      │
-      ▼
+      |
+      v
   inventory  walk tree, tag every file by format/modality/readability,
              collect README / PDF / DOCX / label-hint files
-      │
-      ▼
-   sniff     rule-based layout detection → Recipe(task_type, placements[])
-      │
-      ▼  (if confidence < 0.7 AND agent configured)
-   agent     Gemma 4 E4B proposes a Recipe from inventory + README + metadata
-      │
-      ▼
- materialize hardlink (default) or copy source files into ADDF tree
-      │
-      ▼
+      |
+      v
+   agent     Gemma 4 E4B analyzes the inventory + README + scraped metadata
+             and proposes a Recipe(task_type, placements[])
+      |
+      v
+ materialize hardlink (default) or copy source files into target tree
+      |
+      v
   validate   check dataset_structure_description.json, sample-open one
              file per modality with the right reader
 ```
@@ -35,93 +34,92 @@ downloaded record
 
 ```bash
 # Conform every downloaded zenodo record
-envision-conform --source zenodo
+envision-conform --agent-model ~/models/gemma-4-e4b-it-q4.gguf --source zenodo
 
 # One specific record
-envision-conform --source zenodo --source-id 4521044
+envision-conform --agent-model ~/models/gemma-4-e4b-it-q4.gguf \
+    --source zenodo --source-id 4521044
 
 # Every source directory under ./data/downloads/
-envision-conform --all-sources
+envision-conform --agent-model ~/models/gemma-4-e4b-it-q4.gguf --all-sources
 
 # Put conformed trees elsewhere (e.g. external disk)
-envision-conform --source zenodo \
-    --output-dir /mnt/bigdisk/envision-actionable
+envision-conform --agent-model ~/models/gemma-4-e4b-it-q4.gguf \
+    --source zenodo --output-dir /mnt/bigdisk/envision-actionable
 
 # Copy files instead of hardlinking (uses ~2x disk, portable across filesystems)
-envision-conform --source zenodo --copy
+envision-conform --agent-model ~/models/gemma-4-e4b-it-q4.gguf \
+    --source zenodo --copy
 
-# Enable Gemma 4 agent fallback
-envision-conform --source zenodo \
-    --agent-model ~/models/gemma-4-e4b-it-q4.gguf
+# Re-run only records that failed on a previous run
+envision-conform --agent-model ~/models/gemma-4-e4b-it-q4.gguf \
+    --source zenodo --rerun-status failed
 ```
 
 Or use the module entry point:
 
 ```bash
-python -m envision_eye_actionable --source zenodo
+python -m envision_eye_actionable --agent-model ~/models/gemma-4-e4b-it-q4.gguf \
+    --source zenodo
 ```
 
 ## On-disk layout
 
 ```
 data/actionable/
-└── zenodo/
-    ├── _conform_log.json                           # run summary (status per record)
-    ├── 4521044/
-    │   ├── dataset_structure_description.json      # ADDF v0.1.0 descriptor
-    │   ├── conform_report.json                     # placements + inventory + stats
-    │   ├── _unplaced/                              # files the recipe didn't place
-    │   └── retinal_photography/
-    │       ├── 1_healthy_young_raw_good_quality/
-    │       │   └── <image files hardlinked from downloads/>
-    │       ├── 2_healthy_young_segmented/
-    │       └── …
-    └── 16744782/
-        ├── dataset_structure_description.json
-        ├── conform_report.json
-        └── retinal_photography/
-            └── …
++-- zenodo/
+    +-- _conform_log.json                           # run summary (status per record)
+    +-- 4521044/
+    |   +-- dataset_structure_description.json      # AI-READI schema descriptor
+    |   +-- conform_report.json                     # placements + inventory + stats
+    |   +-- _unplaced/                              # files the recipe didn't place
+    |   +-- retinal_photography/
+    |       +-- 1_healthy_young_raw_good_quality/
+    |       |   +-- <image files hardlinked from downloads/>
+    |       +-- 2_healthy_young_segmented/
+    |       +-- ...
+    +-- 16744782/
+        +-- dataset_structure_description.json
+        +-- conform_report.json
+        +-- retinal_photography/
+            +-- ...
 ```
 
 Hardlinks mean the conformed tree does not double disk usage. The downloaded
-file and the ADDF-placed file are the same inode; deleting either keeps the
+file and the placed file are the same inode; deleting either keeps the
 other alive.
 
-## Sniffer rules (MVP)
+## Agent
 
-| Rule                  | Fires when                                                              | Confidence |
-|-----------------------|--------------------------------------------------------------------------|------------|
-| `paired_image_mask`   | Top-level `images/` + `masks/` (or `labels/`, `gt/`) with ≥50% matching stems | 0.7–0.9 |
-| `image_folder`        | 2+ top-level dirs each containing ≥3 images                              | 0.6–0.9    |
-| `modality_bucket`     | Catch-all — groups files by detected modality                            | 0.5        |
-
-A recipe below the `AGENT_CONFIDENCE_FLOOR` (0.7 by default) is marked
-`status: agent_needed`. The record is still conformed with the best rule we
-have; the status flag just signals that the agent pass should upgrade it.
-
-## Agent integration (not in MVP)
-
-`envision_eye_actionable/agent.py` defines the interface but is not wired to
-an LLM yet. To enable:
-
-1. `pip install envision-eye-actionable[agent]` (pulls llama-cpp-python)
-2. Download a [Gemma 4 E4B GGUF](https://huggingface.co/google/gemma-4-e4b-it-gguf)
-3. Implement `_call_llm()` in `envision_eye_actionable/agent.py`
-4. Pass `--agent-model <path>` on the CLI, or pass `AgentConfig(model_path=...)`
-   programmatically to `conform_record` / `conform_source`
-
+Every record is processed by a local Gemma 4 E4B model (via llama-cpp-python).
 The agent receives:
+
 - the inventory summary (file-type histogram, modality counts, depth, etc.)
-- sampled README text (up to 4 KB)
+- sampled README text (up to 3 KB)
+- sample file paths (first 30 files)
 - dataset metadata from the scrape (title, description, keywords)
 
-…and must return a JSON Recipe matching the same shape the sniffer produces.
-Invalid JSON or parse failures fall back to the sniffer recipe.
+...and returns a JSON Recipe: a list of glob-to-directory placements plus a
+`task_type` (classification, segmentation, detection, or raw).
+
+The model is loaded once per process and cached in memory (~7 GB for the
+Q4_K_M quantization). Typical inference takes 30-90 seconds per record on
+a 2-core CPU.
+
+### Model setup
+
+```bash
+pip install envision-eye-actionable[agent]
+
+# Download the recommended GGUF (~5 GB)
+# https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF
+# Place it somewhere stable, e.g. ~/models/gemma-4-e4b-it-q4.gguf
+```
 
 ## Modality tagging
 
-The inventory maps file extensions to modality tags that match ADDF
-`relatedTerm` entries:
+The inventory maps file extensions to modality tags that correspond to
+`relatedTerm` entries in the AI-READI schema:
 
 | Modality tag          | Triggered by                     | Ontology                          |
 |-----------------------|----------------------------------|-----------------------------------|
@@ -129,10 +127,10 @@ The inventory maps file extensions to modality tags that match ADDF
 | `retinal_imaging`     | .dcm .dicom                      | NCIT C168215 (Retinal Imaging)    |
 | `retinal_oct`         | .fds .fda .e2e .img .oct .vol    | MeSH D041623 (OCT)                |
 | `volumetric_imaging`  | .nii .nii.gz .nrrd .mha .mhd     | NCIT C188577                      |
-| `tabular_data`        | .csv .tsv .xlsx                  | —                                 |
-| `derived_data`        | .h5 .hdf5 .mat .npy .npz         | —                                 |
-| `documentation`       | .pdf .docx .txt .md              | —                                 |
-| `metadata`            | .json .xml .yaml                 | —                                 |
+| `tabular_data`        | .csv .tsv .xlsx                  | --                                |
+| `derived_data`        | .h5 .hdf5 .mat .npy .npz         | --                                |
+| `documentation`       | .pdf .docx .txt .md              | --                                |
+| `metadata`            | .json .xml .yaml                 | --                                |
 
 Unreadable vendor formats (.vol, .nce, .nck, .zrx, .ims, .tco) are still
 placed into the correct modality directory — we just don't decode them. See
@@ -151,8 +149,8 @@ For every conformed record, the validator:
 Validation results appear in `_conform_log.json` and on stdout:
 
 ```
-  [3/85] Conforming zenodo/4521044
-    status=ok  confidence=0.90  validation_ok=True
+  [3/83] Conforming zenodo/4521044
+    status=ok  confidence=0.70  validation_ok=True
 ```
 
 ## Orphan policy
@@ -168,11 +166,8 @@ gap visible for followup.
   conversion to DICOM / numpy arrays is a followup once we decide the
   canonical on-disk form (DICOM-wrapped volumes vs. extracted B-scans).
 - **Extract labels from PDFs / DOCX** — the readers are installed and text
-  extraction works, but no rule consumes them yet. The agent pass is the
-  right place to wire this in.
+  extraction works, but label extraction isn't wired into the agent prompt yet.
 - **Splits** — no train/val/test split handling yet. Most datasets provide
   splits explicitly; the conformer passes them through as directories but
   doesn't tag them.
-- **Deduplicate across sources** — `envision/dedup.py` already handles
-  cross-source dedup on the classification side; the conformer does not re-
-  dedupe at the file level.
+- **Deduplicate across sources** — that lives upstream in envision-discovery.

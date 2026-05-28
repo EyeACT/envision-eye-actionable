@@ -1,4 +1,4 @@
-"""Turn a Recipe into an on-disk ADDF tree."""
+"""Turn a Recipe into an on-disk directory tree (AI-READI schema)."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .inventory import Inventory, FileRecord, FORMAT_TABLE
-from .sniff import Recipe, Placement
+from .recipe import Recipe, Placement
 
 logger = logging.getLogger(__name__)
 
