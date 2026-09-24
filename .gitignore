@@ -37,3 +37,19 @@ data/
 
 # Local conformer scratch
 .conform_tmp/
+
+# Survey outputs and model weights: this repo is public, code and docs only.
+# (per-record creator names/ORCIDs, dataset member paths, raw Zenodo
+# metadata, workbooks, ONNX exports with checkpoint hashes, checkpoints)
+results/
+models/
+ckpt/
+*.onnx
+*.pt
+*.pth
+*.xlsx
+*.jsonl.gz
+survey_scratch/
+
+# Local planning notes (may hold hostnames and paths; never commit)
+.planning/

@@ -63,6 +63,18 @@ agent = [
     "llama-cpp-python>=0.3",
 ]
 
+# Zenodo modality survey (envision-survey). The ONNX export step additionally
+# needs torch + timm, which the survey itself never imports.
+survey = [
+    "onnxruntime>=1.17",
+    "openpyxl>=3.1",
+    "jsonschema>=4.18",
+    "requests>=2.31",
+    # LZW / JPEG / deflate TIFF variants that Pillow cannot open go through
+    # tifffile, which needs imagecodecs for most compressions.
+    "imagecodecs>=2024.1",
+]
+
 dev = [
     "pytest>=7.0.0",
     "black>=23.0.0",
@@ -77,7 +89,11 @@ Repository = "https://github.com/EyeACT/envision-eye-actionable"
 
 [project.scripts]
 envision-conform = "envision_eye_actionable.cli:main"
+envision-survey = "envision_eye_actionable.survey.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["envision_eye_actionable*"]
+
+[tool.setuptools.package-data]
+"envision_eye_actionable.survey" = ["resources/*.json", "resources/README.md", "resources/schemas/*.json", "resources/schemas/LICENSE*"]

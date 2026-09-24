@@ -179,6 +179,32 @@ Applied to 83 downloaded Zenodo eye imaging datasets (644 GB, 421 files):
 The Gemma 4 E4B agent (running locally on CPU via llama.cpp, Q4_K_M
 quantization) produced validated directory trees for 82 of 83 records.
 
+## Zenodo modality survey (`envision-survey`)
+
+A second, lighter pipeline surveys every record of an envision-discovery
+Zenodo scrape. The metadata classifier does not filter records first. The
+survey classifies a seeded sample of each record's images, inside archives
+too, with an ONNX export of the EyeACT 7-class modality classifier (CFP, IR,
+PSC, FAF, OCT, OCTA, NEG) on CPU. It records DICOM-aligned attributes
+(Modality, SOP Class, laterality, dimensions, manufacturer). It writes
+AI-READI / CMDS `dataset_description.json` and
+`dataset_structure_description.json` per record and validates both. Records
+without usable images, or without any eye-modality image, get a catalogue of
+their external dataset links.
+Missing files are streamed and deleted after each record, so the whole
+corpus never has to fit on disk. An Excel workbook summarises the run.
+
+```bash
+pip install -e '.[survey]'
+# Run from the envision-discovery checkout, never from this repo: the
+# survey writes results/, data/ and caches relative to the working dir.
+cd /path/to/envision-discovery
+envision-survey run --model /path/outside/repo/regnety004_synthonly.onnx --limit 3
+envision-survey excel --out results/survey/zenodo_modality_survey.xlsx
+```
+
+See [docs/survey.md](docs/survey.md).
+
 ## Related
 
 - [envision-discovery](https://github.com/EyeACT/envision-discovery) — dataset scraping + classification + download pipeline
@@ -199,5 +225,11 @@ If you use this tool in your research, please cite the EyeACT project:
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Individual dataset licenses vary; check each
+MIT, see [LICENSE](LICENSE). Individual dataset licenses vary; check each
 dataset before use.
+
+The two AI-READI schema files under
+`envision_eye_actionable/survey/resources/schemas/` are not MIT: they are
+Copyright (c) 2024 AI-READI Consortium, licensed CC BY 4.0, and copied
+unmodified (see `schemas/LICENSE.md`, which ships with every wheel and sdist,
+and `survey/resources/README.md`).

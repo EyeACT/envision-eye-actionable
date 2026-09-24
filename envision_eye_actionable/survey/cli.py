@@ -1,0 +1,258 @@
+"""envision-survey: classify every image-bearing Zenodo record of a scrape.
+
+Subcommands:
+
+    envision-survey run          stream, classify, describe (resumable)
+    envision-survey excel        build the workbook from survey_results.jsonl (one or several runs)
+    envision-survey partition    id lists by expected mode (local, remote_zip, download, none)
+    envision-survey export-onnx  export the timm checkpoint to ONNX (needs torch + timm)
+
+Defaults follow the envision-discovery layout, so from the envision-discovery checkout root:
+
+    envision-survey run --limit 3
+    envision-survey run --ids 10043461 7505822
+    envision-survey excel --out ~/zenodo_modality_survey.xlsx
+
+Two processes against Zenodo at once (each with its own out and scratch dir,
+sharing the 429 cooldown, the combined request budget --shared-rpm and the
+disk floor through --shared-state-dir; --rpm gives each its share). Records without
+local metadata (ids_unknown) may need remote zip sampling, hundreds of
+requests each, so they go to the process with the larger budget:
+
+    envision-survey partition --out-dir results/parts
+    envision-survey run --ids-file results/parts/ids_remote_zip.txt --ids-file results/parts/ids_unknown.txt \\
+        --rpm 90 --shared-state-dir results/zenodo_state \\
+        --out-dir results/survey_remote --scratch-dir data/scratch_remote
+    envision-survey run --ids-file results/parts/ids_download.txt --ids-file results/parts/ids_local.txt \\
+        --ids-file results/parts/ids_none.txt --rpm 20 --shared-state-dir results/zenodo_state \\
+        --out-dir results/survey_download --scratch-dir data/scratch_download
+    envision-survey excel --results-dir results/survey_remote --results-dir results/survey_download
+
+The model has no built-in default: pass --model, or set the
+ENVISION_SURVEY_MODEL environment variable to the .onnx file (kept outside
+the repository, with its .json sidecar next to it).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+from pathlib import Path
+
+# The classifier (for example the flagship regnety_004 distilled from
+# synthetic-only training, exported with export-onnx; its .json sidecar holds
+# the checkpoint sha256 and the parity numbers) lives outside the repo.
+MODEL_ENV = "ENVISION_SURVEY_MODEL"
+
+
+def _default_model() -> Path | None:
+    v = os.environ.get(MODEL_ENV, "").strip()
+    return Path(v) if v else None
+
+
+def _add_run(sub):
+    p = sub.add_parser("run", help="classify records (resumable; one JSONL line per record)")
+    p.add_argument("--model", type=Path, default=_default_model(),
+                   help=f"ONNX model from export-onnx (required unless ${MODEL_ENV} is set)")
+    p.add_argument("--scrape", type=Path, default=Path("./results/zenodo_all_results.json"),
+                   help="unfiltered scrape JSON (default: ./results/zenodo_all_results.json)")
+    p.add_argument("--downloads-dir", type=Path, default=None,
+                   help="existing downloads, used in place and never modified (default: ./data/downloads/zenodo; "
+                        "an explicitly given dir must exist)")
+    p.add_argument("--metadata-dir", type=Path, default=Path("./data/metadata/zenodo"),
+                   help="discovery's raw Zenodo record JSONs (default: ./data/metadata/zenodo)")
+    p.add_argument("--out-dir", type=Path, default=Path("./results/survey"),
+                   help="results JSONL, CMDS JSON, predictions, caches (default: ./results/survey)")
+    p.add_argument("--scratch-dir", type=Path, default=Path("./data/survey_scratch"),
+                   help="per-record download/extract scratch under <dir>/records, deleted after each record "
+                        "(default: ./data/survey_scratch; keep it on the big disk). Must be new, empty or "
+                        "created by an earlier survey run (marker file .envision_survey_scratch)")
+    p.add_argument("--max-images", type=int, default=2000,
+                   help="classification cap per record for local and downloaded files (default 2000)")
+    p.add_argument("--remote-cap", type=int, default=300,
+                   help="images sampled per record from zips read remotely, member by member (default 300)")
+    p.add_argument("--max-download-gb", type=float, default=15.0,
+                   help="download non-zip files (rar/7z/tar/gz, top-level images) only when the record needs "
+                        "less than this; larger records get status skipped_size (default 15)")
+    p.add_argument("--no-remote-zip", action="store_true",
+                   help="download missing zips whole (subject to --max-download-gb) instead of sampling remotely")
+    p.add_argument("--remote-nested-max", type=int, default=20,
+                   help="nested archives fetched per record when a remote zip holds zips (default 20)")
+    p.add_argument("--remote-nested-gb", type=float, default=2.0,
+                   help="bytes of nested archives fetched per record from remote zips, in GB; a budget of its "
+                        "own, separate from --max-download-gb (default 2; each nested archive at most 0.5 GB)")
+    p.add_argument("--remote-record-budget-gb", type=float, default=2.0,
+                   help="bytes fetched per record from remote zips (direct members and nested archives "
+                        "together), in GB; sampled members past it are not fetched (default 2)")
+    p.add_argument("--remote-max-member-mb", type=float, default=200.0,
+                   help="remote zip members larger than this are never sampled; another member is drawn "
+                        "instead where possible (default 200)")
+    p.add_argument("--seed", type=int, default=42, help="sampling seed (default 42)")
+    p.add_argument("--threshold", type=float, default=0.6,
+                   help="top-1 probability below this counts as UNCERTAIN (default 0.6)")
+    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--threads", type=int, default=2, help="onnxruntime intra-op threads (default 2)")
+    p.add_argument("--disk-floor-gb", type=float, default=80.0,
+                   help="refuse a record whose download would leave less free space (default 80)")
+    p.add_argument("--download-workers", type=int, default=3, help="parallel file downloads per record")
+    p.add_argument("--download-all", action="store_true",
+                   help="also fetch non-image file types (docs, tables, code, arrays)")
+    p.add_argument("--min-eye-fraction", type=float, default=0.05,
+                   help="a record has eye images (status ok) only when eye classes make up at least this "
+                        "fraction of its non-mask classified images, thresholded labels (default 0.05)")
+    p.add_argument("--min-class-fraction", type=float, default=0.01,
+                   help="in a record with eye images, an eye class is listed as present at this fraction "
+                        "of the non-mask classified images (default 0.01)")
+    p.add_argument("--max-pixels", type=int, default=80_000_000,
+                   help="larger images are inventoried, not decoded (default 80 MP)")
+    p.add_argument("--max-depth", type=int, default=3, help="nested archive depth (default 3)")
+    p.add_argument("--no-link-check", action="store_true", help="skip HTTP status checks of weblinks")
+    p.add_argument("--link-interval", type=float, default=1.0, help="seconds between link checks")
+    p.add_argument("--zenodo-interval", type=float, default=0.5,
+                   help="minimum seconds between two Zenodo requests (default 0.5)")
+    p.add_argument("--rpm", "--zenodo-rpm", dest="zenodo_rpm", type=int, default=110,
+                   help="Zenodo requests per sliding minute for this process, all threads together (default "
+                        "110; Zenodo's guest limit is about 133 per IP). With --shared-state-dir the processes "
+                        "together are also held to --shared-rpm, so --rpm only sets a process's share, "
+                        "e.g. --rpm 90 for remote_zip and --rpm 20 for download")
+    p.add_argument("--shared-state-dir", type=Path, default=None,
+                   help="dir shared by survey processes running at the same time (one IP, one disk): a 429 in "
+                        "one of them pauses all of them (zenodo_not_before), their requests together stay "
+                        "under --shared-rpm (zenodo_requests, under a file lock), and each subtracts the "
+                        "downloads the others have in flight on the same disk before checking "
+                        "--disk-floor-gb (disk_reserve.*). Without it all three are per process")
+    p.add_argument("--shared-rpm", type=int, default=110,
+                   help="Zenodo requests per sliding minute of all the processes sharing --shared-state-dir "
+                        "together (default 110); ignored without --shared-state-dir")
+    p.add_argument("--offline", action="store_true", help="no Zenodo API calls (cache and metadata dir only)")
+    p.add_argument("--keep-scratch", action="store_true", help="do not delete the scratch dir (debugging)")
+    p.add_argument("--no-predictions", action="store_true", help="skip per-image predictions files")
+    p.add_argument("--ids", nargs="+", default=[], help="only these record ids")
+    p.add_argument("--ids-file", type=Path, action="append", default=[],
+                   help="only the record ids in this file (one per line, e.g. from 'partition'); repeatable, "
+                        "combined with --ids")
+    p.add_argument("--limit", type=int, default=None, help="process at most N pending records")
+    p.add_argument("--retry-status", default="",
+                   help="comma-separated statuses to reprocess (e.g. error,skipped_disk,skipped_size,crashed,"
+                        "remote_listing_failed,ok_partial_download)")
+    p.add_argument("-v", "--verbose", action="store_true")
+
+
+def _add_excel(sub):
+    p = sub.add_parser("excel", help="build the Excel workbook from the results JSONL")
+    p.add_argument("--results", type=Path, default=Path("./results/survey/survey_results.jsonl"),
+                   help="results JSONL (ignored when --results-dir is given)")
+    p.add_argument("--results-dir", type=Path, action="append", default=[],
+                   help="a run's --out-dir; repeat to merge the runs of several processes (rows merged by "
+                        "record id, the last dir given wins; CMDS files read from each row's own dir)")
+    p.add_argument("--out", type=Path, default=Path("./results/survey/zenodo_modality_survey.xlsx"))
+    p.add_argument("--model", type=Path, default=_default_model(),
+                   help=f"ONNX model whose .json sidecar goes into the README (default: ${MODEL_ENV})")
+
+
+def _add_partition(sub):
+    p = sub.add_parser("partition", help="split the scrape into id lists by expected mode (no Zenodo requests)")
+    p.add_argument("--scrape", type=Path, default=Path("./results/zenodo_all_results.json"))
+    p.add_argument("--downloads-dir", type=Path, default=Path("./data/downloads/zenodo"))
+    p.add_argument("--metadata-dir", type=Path, action="append", default=[],
+                   help="dirs of legacy Zenodo record JSONs (<id>.json), searched in order; repeatable "
+                        "(default: ./data/metadata/zenodo and ./results/survey/cache/legacy)")
+    p.add_argument("--out-dir", type=Path, default=Path("./results/survey_partitions"),
+                   help="where ids_local.txt, ids_remote_zip.txt, ids_download.txt, ids_none.txt, "
+                        "ids_unknown.txt (no metadata file) and partition_summary.json go")
+    p.add_argument("--no-remote-zip", action="store_true", help="as in run: zips count as downloads")
+    p.add_argument("--download-all", action="store_true", help="as in run")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="envision-survey",
+        description="Zenodo eye-modality survey: ONNX classifier + DICOM-aligned facts + AI-READI/CMDS metadata",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    _add_run(sub)
+    _add_excel(sub)
+    _add_partition(sub)
+    from .export_onnx import add_arguments as _onnx_args
+    _onnx_args(sub.add_parser("export-onnx", help="export the timm checkpoint to ONNX (needs torch + timm)"))
+    args = parser.parse_args(argv)
+
+    if args.cmd == "export-onnx":
+        from .export_onnx import run as _onnx_run
+        return _onnx_run(args)
+
+    if args.cmd == "excel":
+        from .excel import build_workbook, load_model_meta
+        if args.model is None:
+            print(f"[survey] warning: no --model (and no ${MODEL_ENV}); the README sheet gets model provenance "
+                  "and parity only from the result rows", file=sys.stderr, flush=True)
+        if args.results_dir:
+            missing = [d for d in args.results_dir if not d.is_dir()]
+            if missing:
+                parser.error(f"--results-dir {missing[0]} does not exist")
+            source = [d / "survey_results.jsonl" for d in args.results_dir]
+        else:
+            source = args.results
+        stats = build_workbook(source, args.out, load_model_meta(args.model))
+        print(json.dumps(stats, indent=2), flush=True)
+        return 0
+
+    if args.cmd == "partition":
+        from .runner import partition_records
+        meta_dirs = args.metadata_dir or [Path("./data/metadata/zenodo"), Path("./results/survey/cache/legacy")]
+        summary = partition_records(args.scrape, args.downloads_dir, meta_dirs, args.out_dir,
+                                    remote_zip=not args.no_remote_zip, download_all=args.download_all)
+        print(json.dumps(summary, indent=2), flush=True)
+        return 0
+
+    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    from .runner import SurveyConfig, run_survey
+    if args.model is None:
+        parser.error(f"no model: pass --model /path/to/model.onnx or set {MODEL_ENV}")
+    if not args.model.is_file():
+        parser.error(f"--model {args.model} not found (export it with envision-survey export-onnx)")
+    if args.downloads_dir is not None and not args.downloads_dir.is_dir():
+        parser.error(f"--downloads-dir {args.downloads_dir} does not exist (wrong working directory?)")
+    downloads_dir = args.downloads_dir or Path("./data/downloads/zenodo")
+    ids = list(args.ids)
+    if args.ids_file:
+        from .runner import read_ids_file
+        for f in args.ids_file:
+            if not f.is_file():
+                parser.error(f"--ids-file {f} not found")
+            seen = set(ids)
+            ids += [i for i in read_ids_file(f) if i not in seen]
+        if not ids:
+            # An empty id list would mean "every record": refuse instead.
+            parser.error("--ids-file: no record ids in " + ", ".join(str(f) for f in args.ids_file))
+    cfg = SurveyConfig(
+        scrape_path=args.scrape, model_path=args.model, out_dir=args.out_dir,
+        downloads_dir=downloads_dir,
+        metadata_dir=args.metadata_dir if args.metadata_dir and args.metadata_dir.exists() else None,
+        scratch_dir=args.scratch_dir, max_images=args.max_images, remote_cap=args.remote_cap,
+        max_download_gb=args.max_download_gb, remote_zip=not args.no_remote_zip,
+        remote_nested_max=args.remote_nested_max,
+        remote_nested_gb=args.remote_nested_gb, remote_record_budget_gb=args.remote_record_budget_gb,
+        remote_max_member_mb=args.remote_max_member_mb, min_eye_fraction=args.min_eye_fraction,
+        zenodo_per_minute=args.zenodo_rpm, shared_state_dir=args.shared_state_dir,
+        zenodo_shared_per_minute=args.shared_rpm, seed=args.seed,
+        threshold=args.threshold, batch_size=args.batch_size, threads=args.threads,
+        disk_floor_gb=args.disk_floor_gb, download_workers=args.download_workers,
+        download_all=args.download_all, min_class_fraction=args.min_class_fraction,
+        max_pixels=args.max_pixels, max_depth=args.max_depth, check_links=not args.no_link_check,
+        link_interval=args.link_interval, zenodo_interval=args.zenodo_interval,
+        keep_scratch=args.keep_scratch, write_predictions=not args.no_predictions,
+        offline=args.offline, ids=ids, limit=args.limit,
+        retry_statuses=[s.strip() for s in args.retry_status.split(",") if s.strip()],
+    )
+    stats = run_survey(cfg)
+    print(json.dumps(stats, indent=2), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
