@@ -23,7 +23,9 @@ Three roles, three processes, one shared state dir and one spool dir:
   discovery downloads (local originals are read in place). A record whose
   triage sample holds eye classes and has more images to fetch goes back
   to the producer as a deep request; the triage files stay in the spool
-  and are reused.
+  and are reused. With ``--keep-dir`` the fetched files of a record with at
+  least one eye image are moved into the keep dir instead of deleted
+  (keep.py; ``--keep-max-gb`` and the disk floor bound it).
 * ``monitor``: every ``--interval`` seconds, disk, spool size and states,
   request queue, results by status, rates and ETA into
   ``<state>/status.json`` (and one line in ``monitor.jsonl``).
@@ -587,7 +589,15 @@ class Producer:
         except OSError:
             pass
         done = load_statuses(results_path)
-        todo = [r for r in scope if not is_final(done.get(r["source_id"]), cfg.retry_statuses)]
+        # --refetch-keep-ids: records finished before retention existed (their
+        # last final row has no 'kept' field) are fetched and classified
+        # again so that their files reach the keep dir; the new row replaces
+        # the old one (last line wins). Rows written with retention are not
+        # redone, so the option is safe to leave on across restarts.
+        refetch = {str(i) for i in (getattr(cfg, "refetch_ids", None) or [])}
+        refetch = {rid for rid in refetch if is_final(done.get(rid)) and "kept" not in (done.get(rid) or {})}
+        todo = [r for r in scope if not is_final(done.get(r["source_id"]), cfg.retry_statuses)
+                or r["source_id"] in refetch]
         # records a previous producer left ready, awaiting_deep or deep_ready
         # belong to the consumer and the request files, not to the queue
         # (fetching dirs stay in the queue: they are removed and refetched)
@@ -598,12 +608,17 @@ class Producer:
         self._remove_partial("left by an earlier producer")
         self._repair_requests()
         todo = order_records(todo, cfg, self.zenodo)
+        if refetch:
+            # the backfill goes first (cheapest first among it)
+            todo = [r for r in todo if r["source_id"] in refetch] + [r for r in todo if r["source_id"] not in refetch]
         if cfg.limit is not None:
             todo = todo[: cfg.limit]
-        self.status.update(state="running", n_scope=len(scope), n_todo=len(todo), order=cfg.order)
+        self.status.update(state="running", n_scope=len(scope), n_todo=len(todo), order=cfg.order,
+                           n_refetch_keep=len(refetch))
         self._event({"event": "fetch_start", "n_scope": len(scope), "n_todo": len(todo),
+                     "n_refetch_keep": len(refetch),
                      "config": {k: (v if k != "ids" else f"{len(v)} ids") for k, v in vars(cfg).items()
-                                if k not in ("token",)}})
+                                if k not in ("token", "refetch_ids")}})
         print(f"[fetch] {len(scope)} records in scope, {len(todo)} to fetch", flush=True)
         queue = deque(todo)
         futures = {}
@@ -721,6 +736,15 @@ class Processor:
         # final rows (with their finish time): a record whose row was written
         # after its spool marker is done, even if its dir survived a kill
         self.results = ResultsTail(self.survey.results_path)
+        self.keeper = None
+        if getattr(cfg, "keep_dir", None):
+            from .keep import STATUS_NAME, Keeper
+            keep_max = getattr(cfg, "keep_max_gb", None)
+            self.keeper = Keeper(cfg.keep_dir, self.spool, cfg.downloads_dir, cfg.out_dir,
+                                 max_bytes=keep_max * 1e9 if keep_max else None,
+                                 floor_bytes=cfg.disk_floor_gb * 1e9, spool_max_bytes=cfg.spool_max_gb * 1e9,
+                                 status_path=self.state / STATUS_NAME, log_event=self.survey_event)
+            self.status.update(keep=self.keeper.summary())
         self._stop = False
         self._in_record: tuple[str, int] | None = None     # (record id, attempts before the bump)
 
@@ -824,7 +848,12 @@ class Processor:
         rdir = self.spool.record_dir(rid)
         if self._done_since_marker(rid, st):
             # its final row is written: the consumer died between the row and
-            # deleting the dir; do not classify it a second time
+            # deleting the dir; do not classify it a second time. A record
+            # whose row says kept: the move a kill interrupted is finished
+            # first (keep.py).
+            if self.keeper is not None and self.results.kept.get(rid):
+                if not self._keep_move(rid, None):
+                    return "keep_move_retry"
             self.spool.remove(rid)
             self.survey_event({"event": "spool_already_done", "record": rid})
             return "already_done"
@@ -867,6 +896,31 @@ class Processor:
             return self._process_bumped(rid, rec, rdir, m, dm, attempts)
         finally:
             self._in_record = None
+
+    KEEP_MOVE_TRIES = 3
+
+    def _keep_move(self, rid: str, local) -> bool:
+        """Move the record's files to the keep dir. False when the move
+        failed and will be tried again (the spool dir stays); after
+        KEEP_MOVE_TRIES failures the record's remaining files are given up
+        (logged) so that one bad file never blocks the consumer."""
+        try:
+            res = self.keeper.move(rid, local)
+        except OSError as e:
+            n = self.keeper.failures.get(rid, 0) + 1
+            self.keeper.failures[rid] = n
+            self.survey_event({"event": "keep_move_failed", "record": rid, "try": n,
+                               "error": redact(f"{type(e).__name__}: {e}")[:300]})
+            if n < self.KEEP_MOVE_TRIES:
+                return False
+            self.survey_event({"event": "keep_move_gave_up", "record": rid})
+            return True
+        self.keeper.failures.pop(rid, None)
+        self.status.count("kept")
+        self.status.update(keep=self.keeper.summary())
+        self.survey_event({"event": "kept", "record": rid, "moved": res["moved"], "files": res["files"],
+                           "bytes": res["bytes"]})
+        return True
 
     def _done_since_marker(self, rid: str, st: str) -> bool:
         """True when the record's last final row was written after the spool
@@ -913,8 +967,15 @@ class Processor:
         row["fetch_s"] = (m.get("fetch_s") or 0) + ((dm or {}).get("fetch_s") or 0)
         row["spool_bytes"] = int(m.get("bytes") or 0) + int((dm or {}).get("bytes") or 0)
         row["finished_at"] = _now()
+        plan = self.keeper.prepare(rid, row, (m, dm)) if self.keeper is not None else None
         s._append_row(row)                       # durable (fsync) before the spool dir goes
         self.results.poll()
+        if plan is not None and plan["kept"]:
+            if not self._keep_move(rid, plan["local"]):
+                return "row"                     # the move is retried from the already_done path
+        elif plan is not None and plan["reason"] != "no eye image":
+            self.status.count("keep_refused")
+            self.survey_event({"event": "keep_refused", "record": rid, "reason": plan["reason"]})
         self.spool.remove(rid)
         if s.links:
             try:
@@ -939,6 +1000,7 @@ class ResultsTail:
         self.offset = 0
         self.status: dict[str, str] = {}
         self.final_at: dict[str, float] = {}    # finished_at (epoch) of each record's last final row
+        self.kept: dict[str, bool] = {}         # 'kept' of each record's last final row (keep dir)
         self.finished: deque = deque()          # epoch seconds of final rows seen
         self._partial = b""
 
@@ -948,7 +1010,7 @@ class ResultsTail:
         except OSError:
             return
         if size < self.offset:                 # replaced: read again
-            self.offset, self.status, self.final_at, self._partial = 0, {}, {}, b""
+            self.offset, self.status, self.final_at, self.kept, self._partial = 0, {}, {}, {}, b""
         now = time.time()
         with open(self.path, "rb") as fp:
             fp.seek(self.offset)
@@ -977,6 +1039,7 @@ class ResultsTail:
             st = row.get("status")
             self.status[rid] = st
             if is_final(row):
+                self.kept[rid] = bool(row.get("kept"))
                 t = now
                 fin = row.get("finished_at")
                 if fin:
@@ -1042,6 +1105,19 @@ class Monitor:
                            "heartbeat": st.get("heartbeat"), "counters": st.get("counters"),
                            "current": st.get("current"), "waiting": st.get("waiting")}
         snap["roles"] = roles
+        keep_dir = getattr(cfg, "keep_dir", None)
+        if keep_dir:
+            from .keep import STATUS_NAME
+            ks = _read_json(self.state / STATUS_NAME) or {}
+            counters = (roles.get("process") or {}).get("counters") or {}
+            snap["keep"] = {"dir": str(keep_dir), "bytes_gb": ks.get("bytes_gb"), "records": ks.get("records"),
+                            "max_gb": getattr(cfg, "keep_max_gb", None) or None,
+                            "kept_this_run": counters.get("kept", 0),
+                            "refused_this_run": counters.get("keep_refused", 0)}
+            # kept files stay on the disk: keeping stops while the free space
+            # with an empty spool would drop under floor + spool max (keep.py)
+            snap["disk"]["keep_gb"] = ks.get("bytes_gb")
+            snap["disk"]["keep_stops_below_gb"] = round(cfg.disk_floor_gb + cfg.spool_max_gb, 1)
         fstat = _read_json(self.state / "fetch_status.json") or {}
         if self.prev is not None:
             dt = snap["epoch"] - self.prev["epoch"]
@@ -1064,7 +1140,9 @@ class Monitor:
             _append_jsonl(self.state / "monitor.jsonl", {k: v for k, v in out.items() if k != "pipeline"})
             sp = out.get("spool") or {}
             res = out["results"]
-            print(f"[monitor] {out['ts']} free {out['disk']['free_gb']} GB | spool {sp.get('bytes_gb')} GB "
+            kp = out.get("keep")
+            kept_txt = f" | keep {kp.get('bytes_gb')} GB {kp.get('records')} rec" if kp else ""
+            print(f"[monitor] {out['ts']} free {out['disk']['free_gb']} GB{kept_txt} | spool {sp.get('bytes_gb')} GB "
                   f"{sp.get('records')} req {sp.get('requests')} | done {res['n_final']}/{res['n_scope']} "
                   f"({res['rows_last_hour']}/h, eta {res['eta_hours']} h) | fetch "
                   f"{'up' if out['roles']['fetch']['alive'] else 'down'} {out['roles']['fetch']['state']} "

@@ -163,6 +163,9 @@ class SurveyConfig:
     consumer_grace_s: float = 600.0        # producer stops when the consumer is gone this long and it must wait
     max_role_restarts: int = 20            # pipeline: restarts of fetch or process (each) before it gives up
     restart_backoff_s: float = 10.0        # pipeline: first restart delay, doubled per restart, at most 300 s
+    keep_dir: Path | None = None           # process: fetched files of records with an eye image are moved here
+    keep_max_gb: float = 200.0             # keep dir size cap (0: none); past it records are not kept (kept false)
+    refetch_ids: list[str] = field(default_factory=list)   # fetch: redo these finished pre-retention records
     keep_scratch: bool = False
     write_predictions: bool = True
     offline: bool = False

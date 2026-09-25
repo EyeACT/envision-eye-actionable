@@ -219,6 +219,13 @@ RECORD_COLUMNS: list[tuple[str, str]] = [
     ("fetch_s", "Seconds (fetch, pipeline)"),
     ("spool_bytes", "Bytes fetched into the spool (pipeline)"),
     ("deep_fetch_error", "Deep pass fetch error"),
+    ("n_eye_images", "Eye-class images classified (thresholded, MASK excluded)"),
+    ("kept", "Fetched files kept (keep dir)"),
+    ("kept_reason", "Why not kept"),
+    ("kept_path", "Keep dir of the record"),
+    ("kept_files", "Files kept"),
+    ("kept_bytes", "Bytes kept"),
+    ("kept_local_files", "Local originals (not moved; paths in KEPT.json)"),
     ("finished_at", "Finished at (UTC)"),
 ]
 
@@ -489,7 +496,7 @@ def build_workbook(results_path: Path | list[Path], out_path: Path, model_meta: 
 
     # ---- pass 1: statistics, column widths (first 300 rows), format totals
     stats = {"n": len(order), "status": Counter(), "passes": Counter(), "n_classified": 0, "n_eye": 0,
-             "n_mask_dominated": 0, "first": {}, "n_cmds": 0, "n_dirs": 0}
+             "n_mask_dominated": 0, "n_kept": 0, "kept_bytes": 0, "first": {}, "n_cmds": 0, "n_dirs": 0}
     prov_counts: dict[tuple[str, str], Counter] = defaultdict(Counter)
     fmt = {k: (Counter(), Counter()) for k in ("formats_classified", "formats_unread", "conversion_counts")}
     counts = {"weblinks": 0, "record_classes": 0, "archive_probes": 0}
@@ -502,6 +509,8 @@ def build_workbook(results_path: Path | list[Path], out_path: Path, model_meta: 
         stats["n_classified"] += (r.get("n_classified") or 0) > 0
         stats["n_eye"] += bool(r.get("present_eye_classes"))
         stats["n_mask_dominated"] += bool(r.get("mask_dominated"))
+        stats["n_kept"] += bool(r.get("kept"))
+        stats["kept_bytes"] += int(r.get("kept_bytes") or 0) if r.get("kept") else 0
         stats["n_cmds"] += bool(r.get("cmds_dir"))
         stats["n_dirs"] += bool(r.get("cmds_directories"))
         for fld, src in (r.get("cmds_provenance") or {}).items():
@@ -738,6 +747,8 @@ def _readme_rows(stats: dict, paths: list[Path], model_meta: dict | None) -> lis
         ("Records with classified images", stats["n_classified"]),
         ("Records with an eye modality", stats["n_eye"]),
         ("Records mask-dominated (eye classes review only)", stats["n_mask_dominated"]),
+        ("Records whose fetched files were kept (keep dir)", stats["n_kept"]),
+        ("Bytes kept", _human(stats["kept_bytes"])),
         ("", ""),
         ("Scope", "Every record of the unfiltered envision-discovery Zenodo scrape (the records its eye-imaging "
                   "keyword queries found). The SetFit metadata classifier was NOT used to select, skip or order "

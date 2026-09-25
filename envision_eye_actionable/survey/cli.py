@@ -10,6 +10,7 @@ Subcommands:
     envision-survey metadata     prefetch record JSON and DataCite JSON into the metadata cache
     envision-survey excel        build the workbook from survey_results.jsonl (one or several runs)
     envision-survey partition    id lists by expected mode (local, remote_zip, download, none)
+    envision-survey keep-backfill-ids  ids finished before --keep-dir existed that hold an eye image
     envision-survey export-onnx  export the timm checkpoint to ONNX (needs torch + timm)
 
 The full pull (see docs/survey.md):
@@ -221,6 +222,22 @@ def _add_common(p):
     g.add_argument("--exit-when-idle", action="store_true",
                    help="monitor: exit when neither fetch nor process is running")
     g.add_argument("--metadata-threads", type=int, default=2, help="metadata: worker threads (default 2)")
+    g.add_argument("--keep-dir", type=Path, default=None,
+                   help="process: move (rename, never copy) the fetched files of every record with at least one "
+                        "image classified as an eye class into <dir>/<record id>/ instead of deleting them "
+                        "(new, empty or created by the survey, marker .envision_survey_keep; on the spool's "
+                        "filesystem). Rows get kept, kept_reason, kept_path, kept_files, kept_bytes")
+    g.add_argument("--keep-max-gb", type=float, default=200.0,
+                   help="process: stop keeping new records once the keep dir holds this much (their rows get "
+                        "kept false with the reason; kept records are never deleted). Keeping also stops while "
+                        "the free space with an empty spool would fall under --disk-floor-gb + --spool-max-gb "
+                        "(default 200; 0: no size cap)")
+    g.add_argument("--refetch-keep-ids", type=Path, default=None,
+                   help="fetch: fetch and classify again the record ids in this file (one per line, e.g. from "
+                        "keep-backfill-ids) whose last final row was written before --keep-dir existed, so "
+                        "their files reach the keep dir; they go first. The new row replaces the old one (last "
+                        "line wins); rows written with retention are never redone, so the option can stay on "
+                        "across restarts")
     p.add_argument("-v", "--verbose", action="store_true")
 
 
@@ -253,6 +270,15 @@ def _add_partition(sub):
     p.add_argument("--download-all", action="store_true", help="as in run")
 
 
+def _add_keep_backfill(sub):
+    p = sub.add_parser("keep-backfill-ids",
+                       help="list the records finished before --keep-dir existed that hold an eye image")
+    p.add_argument("--out-dir", type=Path, required=True, help="the run's --out-dir (survey_results.jsonl, "
+                                                                "predictions/)")
+    p.add_argument("--keep-dir", type=Path, default=None, help="leave out ids already kept there (KEPT.json)")
+    p.add_argument("--output", type=Path, required=True, help="where the ids go, one per line")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="envision-survey",
@@ -262,6 +288,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_run(sub)
     _add_excel(sub)
     _add_partition(sub)
+    _add_keep_backfill(sub)
     from .export_onnx import add_arguments as _onnx_args
     _onnx_args(sub.add_parser("export-onnx", help="export the timm checkpoint to ONNX (needs torch + timm)"))
     args = parser.parse_args(argv)
@@ -284,6 +311,19 @@ def main(argv: list[str] | None = None) -> int:
             source = args.results
         stats = build_workbook(source, args.out, load_model_meta(args.model), cmds_json=args.cmds_json)
         print(json.dumps(stats, indent=2), flush=True)
+        return 0
+
+    if args.cmd == "keep-backfill-ids":
+        from .keep import backfill_ids
+        res = args.out_dir / "survey_results.jsonl"
+        if not res.is_file():
+            parser.error(f"no {res}")
+        ids, summary = backfill_ids(res, args.out_dir / "predictions", args.keep_dir)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        tmp = args.output.with_name(args.output.name + ".tmp")
+        tmp.write_text("".join(i + "\n" for i in ids), encoding="utf-8")
+        tmp.replace(args.output)
+        print(json.dumps({**summary, "output": str(args.output)}, indent=2), flush=True)
         return 0
 
     if args.cmd == "partition":
@@ -313,6 +353,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.token_file is not None and not args.token_file.expanduser().is_file():
         parser.error(f"--token-file {args.token_file} not found")
     downloads_dir = args.downloads_dir or Path("./data/downloads/zenodo")
+    refetch_ids: list[str] = []
+    if args.refetch_keep_ids is not None:
+        if not args.refetch_keep_ids.is_file():
+            parser.error(f"--refetch-keep-ids {args.refetch_keep_ids} not found")
+        from .runner import read_ids_file
+        refetch_ids = read_ids_file(args.refetch_keep_ids)
+    if args.keep_dir is not None and args.cmd == "run":
+        parser.error("--keep-dir works with the pipeline roles (pipeline, process), not run")
     ids = list(args.ids)
     if args.ids_file:
         from .runner import read_ids_file
@@ -351,6 +399,7 @@ def main(argv: list[str] | None = None) -> int:
         spool_max_gb=args.spool_max_gb, fetch_workers=args.fetch_workers, poll_s=args.poll_s,
         order=args.order, max_attempts=args.max_attempts, consumer_grace_s=args.consumer_grace_s,
         max_role_restarts=args.max_role_restarts, restart_backoff_s=args.restart_backoff_s,
+        keep_dir=args.keep_dir, keep_max_gb=args.keep_max_gb, refetch_ids=refetch_ids,
     )
     if args.cmd == "run":
         stats = run_survey(cfg)

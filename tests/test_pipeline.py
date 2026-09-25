@@ -1563,3 +1563,297 @@ def test_svg_memory_is_bounded(tmp_path, monkeypatch):
            f'{base64.b64encode(photo).decode()}"/></svg>').encode()
     ld = images.load_frame("vector", ".svg", svg, None, max_pixels=5000)
     assert ld.image is None and ld.error.startswith("too_large: embedded image 100x100"), ld.error
+
+
+# ---------------------------------------------------------------------------
+# keep dir: retention of eye-positive records' fetched files (keep.py)
+# ---------------------------------------------------------------------------
+def _keep_files(root: Path) -> set[str]:
+    return {p.relative_to(root).as_posix() for p in Path(root).rglob("*") if p.is_file()}
+
+
+def test_pipeline_keeps_eye_records_and_deletes_the_rest(tmp_path, monkeypatch):
+    """Eye-positive records (deep pass, remote zip; local original) are moved
+    into the keep dir with triage and deep files and their manifests, the
+    rest is deleted; the local original is only referenced."""
+    dark = _png_bytes(size=(64, 48), color=(40, 40, 40))
+    bright = _png_bytes(size=(64, 48), color=(220, 220, 220))
+    local = _zip_bytes({f"l/{i}.png": dark for i in range(3)})
+    records = {
+        "3001": {"ir.zip": _zip_bytes({f"ir/{i:03d}.png": dark for i in range(30)})},      # eye: deep pass
+        "3002": {"neg.zip": _zip_bytes({f"n/{i:03d}.png": bright for i in range(30)})},  # NEG only
+        "3003": {"paper.pdf": b"%PDF-1.4 x"},
+        "3004": {"local.zip": local},
+    }
+    meta = _write_records(tmp_path, records)
+    cfg = _cfg(tmp_path, meta, triage_cap=5, remote_cap=12, keep_dir=tmp_path / "keep", keep_max_gb=10,
+               spool_max_gb=1)
+    (cfg.downloads_dir / "3004").mkdir(parents=True)
+    orig = cfg.downloads_dir / "3004" / "local.zip"
+    orig.write_bytes(local)
+    mtime = orig.stat().st_mtime_ns
+    session = _Multi({rid: _FakeZenodo(rid, files) for rid, files in records.items()})
+    out, prod, proc = _run_roles(cfg, session, monkeypatch, onnx=_NegOnnxStub)
+    assert out == {"fetch": 0, "process": 0}
+    from envision_eye_actionable.survey.results import load_results
+    rows = load_results(cfg.out_dir / "survey_results.jsonl")
+    kroot = (tmp_path / "keep").resolve()
+    r1 = rows["3001"]
+    assert r1["status"] == "ok" and r1["sampling_pass"] == "deep" and r1["n_eye_images"] == 12
+    assert r1["kept"] is True and r1["kept_reason"] == "" and r1["kept_path"] == str(kroot / "3001")
+    kept = _keep_files(kroot / "3001")
+    members = {k for k in kept if k.startswith("remote/")}
+    deep_members = {k for k in kept if k.startswith("deep/")}
+    assert len(members) == 5 and len(deep_members) == 7                 # triage files and deep files
+    assert {"manifest.json", "manifest_deep.json", "listings.json", "KEPT.json"} <= kept
+    assert not kept & {"READY", "DEEP_READY", "AWAITING_DEEP", ".attempts"}
+    assert r1["kept_files"] == 12 and r1["kept_bytes"] == sum(
+        (kroot / "3001" / k).stat().st_size for k in members | deep_members)
+    marker = json.loads((kroot / "3001" / "KEPT.json").read_text())
+    assert marker["files"] == 12 and marker["bytes"] == r1["kept_bytes"]
+    # NEG only and nothing to read: not kept, deleted as before
+    for rid in ("3002", "3003"):
+        assert rows[rid]["kept"] is False and rows[rid]["kept_reason"] == "no eye image"
+        assert not (kroot / rid).exists()
+    # local original: referenced, never moved or copied
+    r4 = rows["3004"]
+    assert r4["kept"] is True and r4["kept_files"] == 0 and r4["kept_local_files"] == 1
+    assert r4["kept_local_paths"] == [str(orig.resolve())]
+    assert json.loads((kroot / "3004" / "KEPT.json").read_text())["local_originals"] == [str(orig.resolve())]
+    assert not any(k.endswith(".zip") for k in _keep_files(kroot / "3004"))
+    assert orig.read_bytes() == local and orig.stat().st_mtime_ns == mtime
+    assert list((cfg.spool_dir / "records").iterdir()) == []
+    ks = json.loads((cfg.state_dir / "keep_status.json").read_text())
+    assert ks["records"] == 2 and ks["bytes"] == sum(
+        p.stat().st_size for p in kroot.rglob("*") if p.is_file() and p.name != "KEPT.json"
+        and p.parent != kroot)
+    from envision_eye_actionable.survey import pipeline
+    snap = pipeline.Monitor(cfg).snapshot()
+    assert snap["keep"]["records"] == 2 and snap["keep"]["kept_this_run"] == 2
+    assert snap["disk"]["keep_gb"] == ks["bytes_gb"]
+
+
+def _eye_spool_record(spool, rid: str, n: int = 4, extra: bool = True):
+    """A ready spool record of n dark (IR) downloaded PNGs, with the scratch
+    and temporary files the keep plan must leave out."""
+    d = spool.record_dir(rid)
+    (d / "dl").mkdir(parents=True)
+    items = []
+    for i in range(n):
+        data = _png_bytes(size=(64, 48), color=(40, 40, 40))
+        (d / "dl" / f"{i}.png").write_bytes(data)
+        items.append({"path": f"dl/{i}.png", "size": len(data), "role": "download", "key": f"{i}.png"})
+    if extra:
+        (d / "work").mkdir()
+        (d / "work" / "extracted.png").write_bytes(b"dup")
+        (d / "dl" / "half.part").write_bytes(b"x")
+    spool.write_manifest(rid, {"items": items, "row": {}})
+    return {f"dl/{i}.png" for i in range(n)}
+
+
+def test_keep_move_survives_a_kill_without_losing_or_duplicating_files(tmp_path, monkeypatch):
+    from envision_eye_actionable.survey import keep, pipeline, runner
+    from envision_eye_actionable.survey.results import load_results
+    monkeypatch.setattr(runner, "OnnxClassifier", _OnnxStub)
+    meta = _write_records(tmp_path, {"3101": {"0.png": b"x"}, "3102": {"0.png": b"x"}})
+    cfg = _cfg(tmp_path, meta, keep_dir=tmp_path / "keep", spool_max_gb=0.001)
+    proc = pipeline.Processor(cfg)
+    s = proc.spool
+    kroot = (tmp_path / "keep").resolve()
+    files = _eye_spool_record(s, "3101")
+    real = keep._rename
+    calls = {"n": 0}
+
+    def killed_after_two(a, b):
+        if calls["n"] == 2:
+            raise KeyboardInterrupt("killed mid-move")
+        calls["n"] += 1
+        return real(a, b)
+
+    monkeypatch.setattr(keep, "_rename", killed_after_two)
+    with pytest.raises(KeyboardInterrupt):
+        proc.process_one("3101")
+    monkeypatch.setattr(keep, "_rename", real)
+    row = load_results(cfg.out_dir / "survey_results.jsonl")["3101"]
+    assert row["status"] == "ok" and row["kept"] is True and row["kept_files"] == 4
+    in_keep = {k for k in _keep_files(kroot / "3101") if k.startswith("dl/")}
+    in_spool = {k for k in _keep_files(s.record_dir("3101")) if k in files}
+    assert in_keep | in_spool == files and not in_keep & in_spool       # nothing lost, nothing twice
+    assert len(in_keep) == 2 and not (kroot / "3101" / "KEPT.json").exists()
+    assert s.state("3101") == "ready"
+    n_lines = len((cfg.out_dir / "survey_results.jsonl").read_text().splitlines())
+    # restart (a fresh results tail): the row is newer than the marker and
+    # says kept: the move is finished, the record is not classified again
+    proc.results = pipeline.ResultsTail(proc.survey.results_path)
+    assert proc.process_one("3101") == "already_done"
+    assert len((cfg.out_dir / "survey_results.jsonl").read_text().splitlines()) == n_lines
+    got = _keep_files(kroot / "3101")
+    assert {k for k in got if k.startswith("dl/")} == files               # the .part file stayed out
+    assert "work/extracted.png" not in got and "READY" not in got
+    assert json.loads((kroot / "3101" / "KEPT.json").read_text())["files"] == 4
+    assert s.state("3101") == "absent"
+    # a kill after every file moved but before the spool dir went: the
+    # marker is written again, nothing moves twice
+    _eye_spool_record(s, "3102", extra=False)
+    orig_remove = s.remove
+
+    def killed(rid):
+        raise KeyboardInterrupt("killed")
+
+    monkeypatch.setattr(s, "remove", killed)
+    with pytest.raises(KeyboardInterrupt):
+        proc.process_one("3102")
+    monkeypatch.setattr(s, "remove", orig_remove)
+    assert (kroot / "3102" / "KEPT.json").exists()
+    assert proc.process_one("3102") == "already_done" and s.state("3102") == "absent"
+    assert json.loads((kroot / "3102" / "KEPT.json").read_text())["files"] == 4
+
+
+def test_keep_guards_refuse_without_deleting_kept_records(tmp_path, monkeypatch):
+    from envision_eye_actionable.survey import keep, pipeline, runner
+    from envision_eye_actionable.survey.results import load_results
+    monkeypatch.setattr(runner, "OnnxClassifier", _OnnxStub)
+    meta = _write_records(tmp_path, {r: {"0.png": b"x"} for r in ("3201", "3202", "3203")})
+    kdir = tmp_path / "keep"
+    kdir.mkdir()
+    (kdir / keep.KEEP_MARKER).write_text("x")
+    (kdir / "3299").mkdir()
+    (kdir / "3299" / "old.png").write_bytes(b"\0" * 5000)          # kept earlier, no marker: measured
+    cfg = _cfg(tmp_path, meta, keep_dir=kdir, keep_max_gb=6e-6, spool_max_gb=0.001)       # 6 kB
+    proc = pipeline.Processor(cfg)
+    assert proc.keeper.total_bytes == 5000
+    _eye_spool_record(proc.spool, "3201", extra=False)
+    assert proc.process_one("3201") == "row"
+    row = load_results(cfg.out_dir / "survey_results.jsonl")["3201"]
+    assert row["kept"] is False and "--keep-max-gb" in row["kept_reason"] and row["kept_files"] == 0
+    assert row["n_eye_images"] == 4
+    assert not (kdir / "3201").exists() and proc.spool.state("3201") == "absent"
+    assert (kdir / "3299" / "old.png").stat().st_size == 5000          # never deleted
+    # the disk guard: free space with an empty spool under floor + spool max
+    proc.keeper.max_bytes = None
+    monkeypatch.setattr(proc.keeper, "_free_if_spool_empty", lambda need: 10)
+    proc.keeper.floor_bytes, proc.keeper.spool_max_bytes = 5, 6
+    _eye_spool_record(proc.spool, "3202", extra=False)
+    assert proc.process_one("3202") == "row"
+    row = load_results(cfg.out_dir / "survey_results.jsonl")["3202"]
+    assert row["kept"] is False and row["kept_reason"].startswith("disk:")
+    monkeypatch.setattr(proc.keeper, "_free_if_spool_empty", lambda need: 11)
+    _eye_spool_record(proc.spool, "3203", extra=False)
+    assert proc.process_one("3203") == "row"
+    assert load_results(cfg.out_dir / "survey_results.jsonl")["3203"]["kept"] is True
+    ev = [json.loads(x)["event"] for x in (cfg.out_dir / "survey_events.jsonl").read_text().splitlines()]
+    assert ev.count("keep_refused") == 2 and ev.count("kept") == 1
+
+
+def test_keep_dir_must_be_its_own_and_on_the_spool_filesystem(tmp_path, monkeypatch):
+    from envision_eye_actionable.survey import keep
+    from envision_eye_actionable.survey.spool import Spool
+    (tmp_path / "dl").mkdir()
+    spool = Spool(tmp_path / "spool", tmp_path / "dl", tmp_path / "out")
+    for bad in (tmp_path / "spool" / "k", tmp_path / "dl" / "k", tmp_path / "out", tmp_path):
+        with pytest.raises(ValueError, match="overlaps"):
+            keep.Keeper(bad, spool, tmp_path / "dl", tmp_path / "out")
+    foreign = tmp_path / "data"
+    foreign.mkdir()
+    (foreign / "x.txt").write_text("mine")
+    with pytest.raises(ValueError, match="not created by the survey"):
+        keep.Keeper(foreign, spool)
+    real_dev = keep._st_dev
+    target = (tmp_path / "k2").resolve()
+    monkeypatch.setattr(keep, "_st_dev", lambda p: real_dev(p) + (Path(p) == target))
+    with pytest.raises(ValueError, match="filesystem"):
+        keep.Keeper(tmp_path / "k2", spool)
+    monkeypatch.setattr(keep, "_st_dev", real_dev)
+    assert keep.Keeper(tmp_path / "k3", spool).total_bytes == 0
+
+
+def test_keep_eye_count_uses_thresholded_eye_labels_only():
+    from envision_eye_actionable.survey import keep
+    assert keep.n_eye_images({"n_IR": 2, "n_MASK": 9, "n_NEG": 4, "n_UNCERTAIN": 3, "n_OCTA": 1}) == 3
+    assert keep.n_eye_images({"n_MASK": 5, "n_NEG": 1, "argmax_IR": 4}) == 0
+    assert keep.n_eye_images({f"n_{c}": 1 for c in ("CFP", "IR", "PSC", "FAF", "OCT", "OCTA")}) == 6
+
+
+def test_keep_plan_leaves_out_markers_scratch_and_temporaries(tmp_path):
+    from envision_eye_actionable.survey import keep
+    d = tmp_path / "123"
+    for rel in ("READY", "DEEP_READY", "AWAITING_DEEP", ".attempts", "RETURNED", "manifest.json",
+                "manifest.json.77.tmp", "dl/a.zip", "dl/b.png.part", "work/x.png", ".fetchwalk/y",
+                "remote/m/1.png", "deep/dl/c.tif", "deep/work/keep.png"):
+        (d / rel).parent.mkdir(parents=True, exist_ok=True)
+        (d / rel).write_bytes(b"1")
+    assert keep.keep_plan(d) == ["deep/dl/c.tif", "deep/work/keep.png", "dl/a.zip", "manifest.json",
+                                 "remote/m/1.png"]
+
+
+def test_backfill_ids_and_refetch_keep_ids(tmp_path, monkeypatch, capsys):
+    import gzip
+    from envision_eye_actionable.survey import cli, pipeline
+    png = _png_bytes(size=(64, 48))
+    rids = ["3301", "3302", "3303", "3304", "3305", "3306"]
+    records = {r: {f"{r}.png": png} for r in rids}
+    meta = _write_records(tmp_path, records)
+    cfg = _cfg(tmp_path, meta, consumer_grace_s=0.0, fetch_workers=1, order="scrape")
+    cfg.out_dir.mkdir(parents=True)
+    rows = [{"record_id": "3301", "status": "ok", "n_IR": 3, "n_classified": 3},        # pre-retention eye
+            {"record_id": "3302", "status": "no_eye_images", "n_NEG": 5, "n_classified": 5},
+            {"record_id": "3303", "status": "ok", "n_CFP": 2, "n_classified": 2, "kept": True},
+            {"record_id": "3304", "status": "mask_dominated", "n_classified": 2},        # eye only in predictions
+            {"record_id": "3305", "status": "ok", "n_IR": 1, "n_classified": 1},
+            {"record_id": "3305", "status": "started"},                                 # in progress: not final
+            {"record_id": "3306", "status": "ok", "n_OCT": 4, "n_classified": 4},      # already kept
+            {"record_id": "3307", "status": "ok", "n_OCT": 4, "n_classified": 4, "spool_bytes": 0}]  # local only
+    (cfg.out_dir / "survey_results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    (cfg.out_dir / "predictions").mkdir()
+    with gzip.open(cfg.out_dir / "predictions" / "3304.jsonl.gz", "wt") as fp:
+        fp.write(json.dumps({"path": "a", "label": "OCT"}) + "\n" + json.dumps({"path": "b", "label": "MASK"}) + "\n")
+    with gzip.open(cfg.out_dir / "predictions" / "3302.jsonl.gz", "wt") as fp:
+        fp.write(json.dumps({"path": "a", "label": "NEG"}) + "\n")
+    kdir = tmp_path / "keep"
+    (kdir / "3306").mkdir(parents=True)
+    (kdir / "3306" / "KEPT.json").write_text("{}")
+    ids_file = tmp_path / "state" / "backfill_keep_ids.txt"
+    assert cli.main(["keep-backfill-ids", "--out-dir", str(cfg.out_dir), "--keep-dir", str(kdir),
+                     "--output", str(ids_file)]) == 0
+    assert ids_file.read_text().split() == ["3301", "3304"]
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["eye_by_rows"] == 2 and summary["predictions_only"] == ["3304"] and summary["already_kept"] == 1
+    assert summary["eye_local_only_not_listed"] == ["3307"]
+    # the producer redoes the listed pre-retention records (first), never a
+    # record whose row was written with retention, plus the unfinished 3305
+    cfg.refetch_ids = ["3301", "3303", "3304"]
+    prod = pipeline.Producer(cfg)
+    prod.zenodo.session = _Multi({rid: _FakeZenodo(rid, f) for rid, f in records.items()})
+    assert prod.run() == 0
+    ev = [json.loads(x) for x in (cfg.state_dir / "fetch_events.jsonl").read_text().splitlines()]
+    fetched = [e["record"] for e in ev if e["event"] == "fetched"]
+    assert fetched == ["3301", "3304", "3305"]
+    assert next(e for e in ev if e["event"] == "fetch_start")["n_refetch_keep"] == 2
+    # the refetched rows replace the old ones (last line wins), and a row
+    # written with retention is not redone on the next start
+    with open(cfg.out_dir / "survey_results.jsonl", "a", encoding="utf-8") as fp:
+        for rid in ("3301", "3304", "3305"):
+            fp.write(json.dumps({"record_id": rid, "status": "ok", "n_IR": 1, "kept": True}) + "\n")
+    from envision_eye_actionable.survey.excel import merge_index
+    assert merge_index([cfg.out_dir / "survey_results.jsonl"])["3304"][2] == "ok"
+    for rid in ("3301", "3304", "3305"):
+        prod.spool.remove(rid)
+    prod2 = pipeline.Producer(cfg)
+    prod2.zenodo.session = _Multi({rid: _FakeZenodo(rid, f) for rid, f in records.items()})
+    assert prod2.run() == 0
+    ev = [json.loads(x) for x in (cfg.state_dir / "fetch_events.jsonl").read_text().splitlines()]
+    starts = [e for e in ev if e["event"] == "fetch_start"]
+    assert starts[-1]["n_refetch_keep"] == 0 and starts[-1]["n_todo"] == 0
+
+
+def test_cli_keep_options(tmp_path):
+    from envision_eye_actionable.survey import cli, excel
+    keys = {k for k, _ in excel.RECORD_COLUMNS}
+    assert {"kept", "kept_reason", "kept_path", "kept_files", "kept_bytes", "n_eye_images"} <= keys
+    model = tmp_path / "m.onnx"
+    model.write_bytes(b"x")
+    with pytest.raises(SystemExit):
+        cli.main(["run", "--model", str(model), "--keep-dir", str(tmp_path / "k")])
+    with pytest.raises(SystemExit):
+        cli.main(["fetch", "--model", str(model), "--spool-dir", str(tmp_path / "s"), "--state-dir",
+                  str(tmp_path / "st"), "--refetch-keep-ids", str(tmp_path / "missing.txt")])

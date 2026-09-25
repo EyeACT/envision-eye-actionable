@@ -41,7 +41,9 @@ def is_final(row: dict | None, retry_statuses=()) -> bool:
 
 def load_statuses(path: Path) -> dict[str, dict]:
     """As load_results, but each record keeps only its status (the fetch
-    role reads a results file of 30,000 large rows at start)."""
+    role reads a results file of 30,000 large rows at start) and, when the
+    row has one, its ``kept`` field (keep dir retention; its absence marks a
+    row written before retention existed)."""
     out: dict[str, dict] = {}
     if not Path(path).exists():
         return out
@@ -55,5 +57,8 @@ def load_statuses(path: Path) -> dict[str, dict]:
             except ValueError:
                 continue
             if row.get("record_id"):
-                out[str(row["record_id"])] = {"status": row.get("status")}
+                d = {"status": row.get("status")}
+                if "kept" in row:
+                    d["kept"] = row["kept"]
+                out[str(row["record_id"])] = d
     return out

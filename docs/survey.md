@@ -462,6 +462,81 @@ Kill any role (or the whole pipeline) and start the same command again:
 - `--retry-status` works as in `run`: the producer fetches those records
   again and the consumer replaces their rows.
 
+### Keeping eye-positive records (`--keep-dir`)
+
+By default the consumer deletes every record's spool dir once its row is
+written. With `--keep-dir DIR` a record whose row holds at least one image
+classified as an eye class (thresholded label, MASK excluded: `n_CFP`,
+`n_IR`, `n_PSC`, `n_FAF`, `n_OCT`, `n_OCTA`; the row's `n_eye_images`)
+has its fetched files moved into `DIR/<record id>/` instead; every other
+record is deleted as before. This holds at every pass: a record whose
+triage sample has no eye image is deleted after triage; a record that
+goes on to its deep pass keeps its triage files in the spool meanwhile,
+and at its final row the triage and the deep files are kept together.
+
+What is kept, relative paths preserved: `dl/` (files downloaded whole:
+archives, top-level images), `remote/` (zip members and nested archives
+read remotely), `deep/...` (the same for the deep pass), and
+`manifest.json`, `manifest_deep.json`, `listings.json` (which Zenodo file
+each path is). Left out: the spool markers, temporary files and the
+scratch dirs `work/` and `.fetchwalk/`. Extractions (nested archive
+members, joined split sets) are copies of what the kept archives hold, so
+keeping the archive is enough; the predictions file names each classified
+member inside it. Local originals (the discovery downloads) are never
+moved or copied: `DIR/<id>/KEPT.json` lists their paths (and the row the
+first 20, `kept_local_paths`).
+
+Moves are renames, one per file, never copies: the keep dir must be on the
+spool's filesystem (checked at start) and, like the spool, new, empty or
+marked by the survey (`.envision_survey_keep`), not inside or around the
+spool, downloads or output dir. The survey never deletes anything in it.
+Order: the row (with `kept` true) is written and fsynced, each file is
+renamed, `KEPT.json` is written, the spool dir is deleted. A kill anywhere
+in between leaves the spool dir with its `READY` marker; on restart the
+consumer finds the row newer than the marker with `kept` true, moves what
+is left and writes `KEPT.json` again, without classifying the record a
+second time. A file is at every moment in the spool or in the keep dir,
+never in both, and a second move onto the same path replaces it, so
+nothing is lost or duplicated.
+
+Guards. Kept files are never freed, so keeping is bounded: `--keep-max-gb`
+(default 200; 0 for no cap) caps the keep dir, and a record is kept only
+while the free space, counted as if the spool were empty, stays at least
+`--disk-floor-gb` + `--spool-max-gb`. The producer's disk floor keeps
+working as before (it pauses at the floor), and because of the second
+guard the spool always keeps its full budget above the floor, so keeping
+never turns records into `skipped_disk` rows. A record refused by a guard
+gets `kept` false with `kept_reason`, event `keep_refused`, and its files
+are deleted; records already kept stay.
+
+Row columns (also in the workbook): `n_eye_images`, `kept`, `kept_reason`
+(`no eye image` or the guard), `kept_path`, `kept_files` and `kept_bytes`
+(data files, manifests not counted), `kept_local_files`,
+`kept_local_paths`. The consumer writes `<state>/keep_status.json` (records
+and bytes in the keep dir); the monitor adds a `keep` block (dir, GB,
+records, cap, kept and refused this run) and `disk.keep_gb` to
+`status.json` and its log line.
+
+Backfill (records finished before `--keep-dir` was given, whose files were
+deleted): `keep-backfill-ids` lists the records whose last final row has
+no `kept` field and holds an eye image, by the row's counts or by its
+predictions file, leaving out ids that already have a `KEPT.json` and
+records that fetched nothing (`spool_bytes` 0: local originals only, read
+in place, so nothing was deleted; listed under
+`eye_local_only_not_listed` in the summary):
+
+```bash
+envision-survey keep-backfill-ids --out-dir $OUT --keep-dir $KEEP --output $STATE/backfill_keep_ids.txt
+```
+
+Then start the pipeline with `--refetch-keep-ids $STATE/backfill_keep_ids.txt`
+(and `--keep-dir`): the producer fetches those records first and the
+consumer classifies them again (same seed, same sample) and keeps their
+files. The new row replaces the old one (the last line of a record wins,
+in the producer, the monitor and the workbook). Only ids whose last final
+row has no `kept` field are redone, so the option can stay on across
+restarts: a record already backfilled is never fetched again.
+
 ### Operating guide
 
 From the envision-discovery checkout root, with the 30,501-record scrape
@@ -528,6 +603,7 @@ Files in the state dir:
 | `logs/<role>.log` | pipeline | each role's output |
 | `locks/<role>.lock` | each role | one process per role; liveness |
 | `zenodo_requests`, `zenodo_not_before`, `disk_reserve.*` | fetch (and process) | shared request budget, 429 cooldown, in-flight disk reservations |
+| `keep_status.json` | process (with `--keep-dir`) | records and bytes in the keep dir |
 
 Pipeline options (besides the `run` options above, which all roles
 accept):
@@ -547,6 +623,9 @@ accept):
 | `--poll-s` | 10 | polling interval of the roles |
 | `--interval` | 60 | monitor snapshot interval |
 | `--once`, `--exit-when-idle` | off | monitor: one snapshot; or stop when neither role runs |
+| `--keep-dir` | none | process: move the fetched files of records with an eye image here instead of deleting them |
+| `--keep-max-gb` | 200 | process: keep no new record past this size of the keep dir (0: no cap) |
+| `--refetch-keep-ids` | none | fetch: redo these pre-retention records first so their files reach the keep dir |
 
 ## How a record is processed
 

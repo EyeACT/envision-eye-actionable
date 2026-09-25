@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
 import time
 from pathlib import Path
 
@@ -49,8 +50,11 @@ STATES = ("absent", "fetching", "ready", "awaiting_deep", "deep_ready")
 
 
 def _fsync_write(path: Path, text: str):
-    """Write ``text`` to ``path`` atomically and durably (tmp, fsync, replace)."""
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    """Write ``text`` to ``path`` atomically and durably (tmp, fsync, replace).
+    The tmp name holds the pid and the thread id: two writers of one file
+    (the consumer asking for a deep pass while the producer restores the
+    same request) never share a tmp file."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     with open(tmp, "w", encoding="utf-8") as fp:
         fp.write(text)
         fp.flush()
