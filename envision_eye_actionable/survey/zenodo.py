@@ -13,7 +13,7 @@ Metadata sources, in order of preference:
 Zenodo's guest limit is about 133 requests per minute, so every request
 (metadata calls, file downloads, zip listings, member fetches and range
 reads, across all worker threads) goes through one shared throttle: at most
-``max_per_minute`` requests in any 60 s window (default 110) and at least
+``max_per_minute`` requests in any 60 s window (default 120) and at least
 ``min_interval`` seconds between two requests. A 429 sets a shared cooldown
 from Retry-After (seconds or HTTP-date, at least 60 s when absent) that every
 worker waits on; 5xx responses and transport errors back off exponentially
@@ -23,10 +23,24 @@ things are shared between the processes using that dir: the 429 cooldown
 waits on) and the per-minute budget. For the budget, every request is
 logged as a wall-clock time in ``zenodo_requests`` under a file lock, and a
 request goes out only while all the processes together sent fewer than
-``shared_per_minute`` (default 110, ``--shared-rpm``) in the last 60 s. The
+``shared_per_minute`` (default 120, ``--shared-rpm``) in the last 60 s. The
 per-process ``max_per_minute`` (``--rpm``) still applies on top, so it can
 give one process a smaller share, but two processes left at the default no
 longer add up to more than the combined budget.
+
+Zenodo's X-RateLimit-Remaining header is read on every response: when it
+drops to RATE_REMAINING_FLOOR or below, every request pauses until the
+window resets (X-RateLimit-Reset), whatever the local count says.
+
+Access token: with ``ZENODO_TOKEN`` in the environment, ``token_file``
+(one line) or, when neither is given, DEFAULT_TOKEN_FILE when it exists,
+requests to zenodo.org carry ``Authorization: Bearer``. The token does not
+raise the rate limit; it only opens records the account was granted. It is
+sent to zenodo.org hosts only (never to other hosts, never on a redirect
+elsewhere) and is never logged, printed or written anywhere. As a
+safeguard it is registered with redact() when loaded: result, event,
+status and predictions lines pass through redact(), and
+install_log_redaction() puts a RedactingFilter on the log handlers.
 """
 
 from __future__ import annotations
@@ -43,14 +57,133 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import requests
+from requests.auth import AuthBase
 
 logger = logging.getLogger(__name__)
 
 API = "https://zenodo.org/api/records"
-MAX_PER_MINUTE = 110   # below Zenodo's ~133/min guest limit
+MAX_PER_MINUTE = 120   # below Zenodo's 133 per 60 s window (per IP and User-Agent, token or not)
 RETRY_STATUSES = (429, 500, 502, 503, 504)
 SHARED_COOLDOWN_NAME = "zenodo_not_before"   # in --shared-state-dir: wall-clock end of a 429 cooldown
 SHARED_REQUESTS_NAME = "zenodo_requests"     # in --shared-state-dir: wall-clock times of the last minute's requests
+RATE_REMAINING_FLOOR = 3                      # pause until the window resets at this many requests left
+TOKEN_ENV = "ZENODO_TOKEN"
+# Read when neither ZENODO_TOKEN nor --token-file is given and the file exists.
+DEFAULT_TOKEN_FILE = Path("~/.config/envision-survey/zenodo_token")
+REDACTED = "[REDACTED]"
+
+_SECRETS: set[str] = set()
+_SECRETS_LOCK = threading.Lock()
+
+
+def register_secret(value: str | None):
+    """Remember a secret so redact() removes it from any text."""
+    if value and len(value) >= 8:
+        with _SECRETS_LOCK:
+            _SECRETS.add(value)
+
+
+def redact(text):
+    """``text`` with every registered secret replaced by [REDACTED]
+    (non-strings are returned unchanged)."""
+    if not isinstance(text, str) or not _SECRETS:
+        return text
+    for s in tuple(_SECRETS):
+        if s in text:
+            text = text.replace(s, REDACTED)
+    return text
+
+
+class RedactingFilter(logging.Filter):
+    """Logging filter that removes registered secrets from the message and
+    its arguments (attach it to handlers: filters on a logger do not see
+    records propagated from child loggers)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if _SECRETS:
+            try:
+                msg = record.getMessage()
+            except Exception:  # noqa: BLE001 - never let logging fail
+                return True
+            clean = redact(msg)
+            if clean != msg:
+                record.msg, record.args = clean, None
+            if record.exc_info and record.exc_info[1] is not None:
+                text = logging.Formatter().formatException(record.exc_info)
+                if redact(text) != text:
+                    record.exc_info, record.exc_text = None, None
+                    record.msg = f"{record.msg}\n{redact(text)}"
+        return True
+
+
+def install_log_redaction(logger_: logging.Logger | None = None):
+    """Attach a RedactingFilter to every handler of ``logger_`` (default:
+    the root logger), once."""
+    lg = logger_ or logging.getLogger()
+    for h in lg.handlers:
+        if not any(isinstance(f, RedactingFilter) for f in h.filters):
+            h.addFilter(RedactingFilter())
+
+
+def token_source(token_file: Path | None = None) -> str:
+    """Where load_token takes the token from: 'env', 'file', 'default_file'
+    or 'none' (the value is never returned)."""
+    if os.environ.get(TOKEN_ENV, "").strip():
+        return "env"
+    if token_file is not None:
+        return "file"
+    if DEFAULT_TOKEN_FILE.expanduser().is_file():
+        return "default_file"
+    return "none"
+
+
+def load_token(token_file: Path | None = None, use_default: bool = True) -> str | None:
+    """Zenodo access token from ``ZENODO_TOKEN``, else the first line of
+    ``token_file``, else (``use_default``) of DEFAULT_TOKEN_FILE when it
+    exists; None when there is none. An explicit ``token_file`` that cannot
+    be read is an error. The token is registered for redaction and never
+    logged."""
+    tok = os.environ.get(TOKEN_ENV, "").strip()
+    if tok:
+        register_secret(tok)
+        return tok
+    path = Path(token_file).expanduser() if token_file is not None else None
+    if path is None and use_default and DEFAULT_TOKEN_FILE.expanduser().is_file():
+        path = DEFAULT_TOKEN_FILE.expanduser()
+    if path is None:
+        return None
+    try:
+        tok = path.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+    except (OSError, IndexError):
+        raise ValueError(f"cannot read the Zenodo token file {path}") from None
+    register_secret(tok)
+    return tok or None
+
+
+def _is_zenodo_host(url: str) -> bool:
+    from urllib.parse import urlparse
+    host = (urlparse(url).hostname or "").lower()
+    return host == "zenodo.org" or host.endswith(".zenodo.org")
+
+
+class ZenodoBearer(AuthBase):
+    """Adds ``Authorization: Bearer`` to requests for zenodo.org hosts only.
+    Its repr never shows the token."""
+
+    def __init__(self, token: str):
+        self._token = token
+
+    def __call__(self, r):
+        if _is_zenodo_host(r.url):
+            r.headers["Authorization"] = f"Bearer {self._token}"
+        else:
+            r.headers.pop("Authorization", None)
+        return r
+
+    def __repr__(self) -> str:
+        return "ZenodoBearer(<token hidden>)"
+
+    __str__ = __repr__
 
 
 class RemoteError(RuntimeError):
@@ -112,6 +245,7 @@ class ZenodoClient:
         max_per_minute: int | None = MAX_PER_MINUTE,
         shared_state_dir: Path | None = None,
         shared_per_minute: int | None = MAX_PER_MINUTE,
+        token: str | None = None,
     ):
         self.cache_dir = cache_dir
         self.metadata_dir = metadata_dir
@@ -120,6 +254,10 @@ class ZenodoClient:
         self.offline = offline
         self.session = requests.Session()
         self.session.headers["User-Agent"] = USER_AGENT
+        self.authenticated = bool(token)
+        if token:
+            register_secret(token)
+            self.session.auth = ZenodoBearer(token)
         self._lock = threading.Lock()
         self._last = float("-inf")
         self._not_before = 0.0
@@ -244,6 +382,27 @@ class ZenodoClient:
 
     _throttle = throttle  # backwards-compatible name
 
+    def observe(self, r) -> None:
+        """Read Zenodo's X-RateLimit-Remaining / X-RateLimit-Reset from a
+        response: at RATE_REMAINING_FLOOR requests left or fewer, pause every
+        request (of this process and, with a shared state dir, of the others)
+        until the window resets."""
+        try:
+            remaining = r.headers.get("X-RateLimit-Remaining")
+            if remaining is None or int(remaining) > RATE_REMAINING_FLOOR:
+                return
+            reset = r.headers.get("X-RateLimit-Reset")
+            if reset:
+                v = float(reset)
+                wait = v - time.time() if v > 1e9 else v      # epoch seconds, or seconds left
+            else:
+                wait = 60.0
+            wait = min(max(wait, 1.0), 120.0)
+        except (TypeError, ValueError, AttributeError):
+            return
+        logger.info("Zenodo rate limit: %s requests left, pausing %.0fs", remaining, wait)
+        self.backoff(wait)
+
     def backoff(self, seconds: float):
         """Pause every request of this client for ``seconds`` (after a 429),
         and of every process sharing its state dir. Never waits on a sleeping
@@ -262,10 +421,11 @@ class ZenodoClient:
             try:
                 r = self.session.get(url, headers={"Accept": accept}, timeout=(20, 60))
             except requests.RequestException as e:
-                logger.warning("GET %s failed (%s), attempt %d", url, e, attempt + 1)
+                logger.warning("GET %s failed (%s), attempt %d", url, type(e).__name__, attempt + 1)
                 time.sleep(delay)
                 delay = min(delay * 2, 120)
                 continue
+            self.observe(r)
             if r.status_code == 200:
                 try:
                     return r.json()
@@ -302,10 +462,11 @@ class ZenodoClient:
                 r = self.session.get(url, headers=headers or {}, stream=stream, timeout=timeout)
             except requests.RequestException as e:
                 last, status = f"{type(e).__name__}", None
-                logger.warning("GET %s failed (%s), attempt %d", url, e, attempt + 1)
+                logger.warning("GET %s failed (%s), attempt %d", url, type(e).__name__, attempt + 1)
                 time.sleep(delay)
                 delay = min(delay * 2, max_delay)
                 continue
+            self.observe(r)
             if 200 <= r.status_code < 300:
                 return r
             status = r.status_code
@@ -440,6 +601,8 @@ def stream_download(
             headers["Range"] = f"bytes={have}-"
         try:
             with session.get(url, headers=headers, stream=True, timeout=(30, 300)) as r:
+                if throttle is not None and hasattr(throttle, "observe"):
+                    throttle.observe(r)
                 if r.status_code == 416 and expected_size and have >= expected_size:
                     pass  # already complete
                 elif r.status_code in (200, 206):
@@ -469,7 +632,7 @@ def stream_download(
                 else:
                     return False, f"HTTP {r.status_code}"
         except requests.RequestException as e:
-            logger.warning("download %s interrupted (%s), attempt %d", url, e, attempt + 1)
+            logger.warning("download %s interrupted (%s), attempt %d", url, type(e).__name__, attempt + 1)
             last_err = f"{type(e).__name__}"
             pause()
             continue

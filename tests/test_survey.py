@@ -526,10 +526,13 @@ class _Session:
 
 class _Throttle:
     def __init__(self):
-        self.waits, self.backoffs = 0, []
+        self.waits, self.backoffs, self.observed = 0, [], []
 
     def throttle(self):
         self.waits += 1
+
+    def observe(self, r):
+        self.observed.append(r.status_code)
 
     def backoff(self, s):
         self.backoffs.append(s)
@@ -586,7 +589,7 @@ def test_workbook_sheets_and_directory_counts(tmp_path):
     (out / "cmds" / "1" / "dataset_description.json").write_text('{"a": 1}', encoding="utf-8")
     rows = [{"record_id": "1", "status": "ok", "cmds_dir": "cmds/1", "cmds_directories": "retinal_photography/cfp (3)",
              "dd_dates": "Issued: 2023", "laterality_source": "basename:3"},
-            {"record_id": "2", "status": "no_usable_images", "cmds_dir": "cmds/2", "cmds_directories": ""}]
+            {"record_id": "2", "status": "no_image_files", "cmds_dir": "cmds/2", "cmds_directories": ""}]
     res = out / "survey_results.jsonl"
     res.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
     build_workbook(res, out / "w.xlsx")
@@ -752,23 +755,28 @@ def test_jpeg_facts_carry_the_compression_method():
 def test_compressed_non_images_are_not_downloaded():
     assert wanted_for_download("scan.tif.gz") and wanted_for_download("dicoms.tar.bz2")
     assert wanted_for_download("slice.nii.gz") and wanted_for_download("IM0001.gz")
-    for name in ("table.csv.gz", "genes.gtf.gz", "arr.npy.gz", "notes.txt.xz", "model.h5.gz"):
+    # arrays are pixel-bearing now (image-shaped datasets are converted)
+    assert wanted_for_download("arr.npy.gz") and wanted_for_download("stack.h5.gz")
+    for name in ("table.csv.gz", "genes.gtf.gz", "notes.txt.xz", "weights.pt.gz"):
         assert not wanted_for_download(name), name
 
 
 def test_planar_tiff_uses_image_dimensions(tmp_path):
     tifffile = pytest.importorskip("tifffile")
-    from envision_eye_actionable.survey.images import _load_tiff_tifffile
+    from envision_eye_actionable.survey.images import _load_tiff
     arr = np.random.default_rng(0).integers(0, 4000, (3, 40, 50)).astype(np.uint16)
     p = tmp_path / "planar.tif"
     tifffile.imwrite(p, arr, photometric="rgb", planarconfig="separate")
-    ld = _load_tiff_tifffile(None, p, max_pixels=10_000)
+    ld = _load_tiff(None, p, ".tif", max_pixels=10_000)
     assert (ld.facts["rows"], ld.facts["cols"], ld.facts["samples"]) == (40, 50, 3)
     assert ld.image is not None and ld.image.size == (50, 40)
-    # byte cap: 40*50*3*2 = 12000 bytes
-    assert _load_tiff_tifffile(None, p, max_pixels=10_000, max_bytes=10_000).error == "too_large"
-    # pixel cap on H*W (2000), not on S*H (120)
-    assert _load_tiff_tifffile(None, p, max_pixels=1_999).error == "too_large"
+    assert "strided" not in ld.facts["conversion"]
+    # over the byte budget (40*50*3*2 = 12000 bytes) or the pixel budget on
+    # H*W (2000, not S*H = 120): read strided, never refused
+    ld = _load_tiff(None, p, ".tif", max_pixels=10_000, max_bytes=10_000)
+    assert ld.image is not None and "strided 1/" in ld.facts["conversion"]
+    ld = _load_tiff(None, p, ".tif", max_pixels=1_999)
+    assert ld.image is not None and ld.image.size == (25, 20) and "strided 1/2" in ld.facts["conversion"]
 
 
 def test_datacite_subject_codes_and_keywords_are_merged():
@@ -836,7 +844,7 @@ def test_link_checker_429_cooldown_and_cache(tmp_path, monkeypatch):
     lc3 = weblinks.LinkChecker(tmp_path / "l3.json", min_interval=0, zenodo=th)
     lc3.session = _LinkSession([429, 200])
     lc3.check("https://doi.org/10.5281/zenodo.123")
-    assert th.waits == 2 and th.backoffs == [1.0]
+    assert th.waits == 2 and th.backoffs == [1.0] and th.observed == [429, 200]
 
 
 def test_metadata_only_cmds_for_records_without_classification(tmp_path):
@@ -1156,6 +1164,7 @@ def _survey(tmp_path, legacy: dict, files: dict, rid: str, **cfg_kw):
     meta.mkdir(exist_ok=True)
     (meta / f"{rid}.json").write_text(json.dumps(legacy), encoding="utf-8")
     (tmp_path / "dl").mkdir(exist_ok=True)
+    cfg_kw.setdefault("triage_cap", 0)          # one pass, unless a test asks for the two-pass sampling
     cfg = SurveyConfig(scrape_path=tmp_path / "s.json", model_path=tmp_path / "m.onnx", out_dir=tmp_path / "out",
                        downloads_dir=tmp_path / "dl", metadata_dir=meta, scratch_dir=tmp_path / "scratch",
                        check_links=False, disk_floor_gb=0, **cfg_kw)
@@ -1690,6 +1699,19 @@ class _BrightNegDarkOctClf:
         return p
 
 
+class _MaskOctaClf(_BrightNegDarkOctClf):
+    """As _BrightNegDarkOctClf, but noise-free inputs (a binary mask comes
+    out flat once content-cropped to its foreground) are OCTA, as missed
+    masks are with the real model."""
+
+    def predict(self, batch):
+        p = super().predict(batch)
+        hi = batch[:, 0].std(axis=(1, 2)) < 0.01
+        p[hi] = 0.01
+        p[hi, 5] = 0.94
+        return p
+
+
 def test_remote_direct_and_nested_images_are_separate_strata(tmp_path):
     pytest.importorskip("jsonschema")
     rid = "630"
@@ -1887,7 +1909,7 @@ def test_eye_status_needs_the_min_eye_fraction_of_non_mask_images(tmp_path, n_ey
                | {f"seg/{i:02d}.png": _mask_png() for i in range(30)})   # masks do not dilute the fraction
     files = {"d.zip": _zip_bytes(members)}
     s = _survey(tmp_path, _legacy(rid, files), files, rid, remote_cap=100)
-    s.clf = _BrightNegDarkOctClf()
+    s.clf = _MaskOctaClf()
     row = s.process_record({"source_id": rid, "title": "T"})
     assert row["status"] == status, row.get("error")
     assert row["eye_image_fraction"] == round(n_eye / 50, 4)
@@ -1931,7 +1953,9 @@ def test_remote_members_over_the_cap_are_replaced_and_the_record_budget_stops_fe
     big = {f"b/{i}.png": _png_bytes(size=(400, 300), color=(i * 9, 80, 80)) for i in range(5)}
     data = _zip_bytes(small | big)
     zips = [{"key": "x.zip", "size": len(data)}]
-    cap_bytes = max(len(v) for v in small.values()) + 1
+    # the cap applies to the bytes a fetch moves (compressed size; deflate
+    # adds a few bytes to an incompressible PNG)
+    cap_bytes = max(len(v) for v in small.values()) + 64
     assert min(len(v) for v in big.values()) > cap_bytes
     c = _client(tmp_path, _FakeZenodo("80", {"x.zip": data}))
     res = remote.sample_remote_zips(c, "80", zips, tmp_path / "r", 10, random.Random(1),
@@ -2124,7 +2148,7 @@ def test_oversize_remote_members_stay_out_of_the_population(tmp_path):
         buf = io.BytesIO()
         Image.fromarray(rng.integers(0, 255, (120, 160, 3), dtype=np.uint8)).save(buf, "PNG")
         big[f"b/OD_{i}.png"] = buf.getvalue()
-    cap = max(len(v) for v in small.values()) + 1
+    cap = max(len(v) for v in small.values()) + 64     # compressed size (see above)
     assert min(len(v) for v in big.values()) > cap
     files = {"x.zip": _zip_bytes(small | big)}
     s = _survey(tmp_path, _legacy(rid, files), files, rid, remote_cap=50, remote_max_member_mb=cap / 1e6)
@@ -2407,8 +2431,8 @@ def _mask_record(tmp_path, rid: str, n_mask: int, n_photo: int):
 
 def test_mask_dominated_record_is_not_ok_from_a_small_remainder(tmp_path):
     pytest.importorskip("jsonschema")
-    s, row = _mask_record(tmp_path / "a", "740", n_mask=30, n_photo=10)
-    assert row["n_MASK"] == 30 and row["n_classified_non_mask"] == 10, row.get("error")
+    s, row = _mask_record(tmp_path / "a", "740", n_mask=30, n_photo=8)
+    assert row["n_MASK"] == 30 and row["n_classified_non_mask"] == 8, row.get("error")
     assert row["status"] == "mask_dominated"
     assert row["mask_dominated"] is True
     assert row["present_eye_classes"] == "" and row["review_eye_classes"] == "IR"
@@ -2422,7 +2446,9 @@ def test_mask_dominated_record_is_not_ok_from_a_small_remainder(tmp_path):
 @pytest.mark.parametrize("n_mask,n_photo,status", [
     (60, 50, "ok"),     # masks over half, but 50 non-mask images: the normal rule
     (20, 30, "ok"),     # under 50 non-mask images, but masks under half
-    (30, 30, "mask_dominated"),   # exactly half masks, 30 non-mask images
+    (30, 9, "mask_dominated"),    # masks over half, 9 confident IR images: under the exemption
+    (30, 30, "ok"),     # exactly half masks, 30 confident IR images: exempt (photos next to masks)
+    (30, 10, "ok"),     # 10 confident IR images: exempt
 ])
 def test_mask_dominated_needs_both_the_mask_share_and_a_small_remainder(tmp_path, n_mask, n_photo, status):
     pytest.importorskip("jsonschema")
@@ -2439,7 +2465,7 @@ def test_workbook_shows_mask_dominated_records_and_full_cmds_folders(tmp_path):
     pytest.importorskip("openpyxl")
     from envision_eye_actionable.survey.excel import build_workbook
     from openpyxl import load_workbook
-    s, row = _mask_record(tmp_path / "a", "742", n_mask=30, n_photo=10)
+    s, row = _mask_record(tmp_path / "a", "742", n_mask=30, n_photo=8)
     s2, row2 = _mask_record(tmp_path / "b", "743", n_mask=5, n_photo=10)
     assert row["status"] == "mask_dominated" and row2["status"] == "ok"
     for srv, r in ((s, row), (s2, row2)):
@@ -2471,3 +2497,1059 @@ def test_workbook_shows_mask_dominated_records_and_full_cmds_folders(tmp_path):
     cj = {r[0].value: r[1].value for r in wb["CMDS_JSON"].iter_rows(min_row=2)}
     assert cj["742"] == (s.cfg.out_dir.resolve() / "cmds" / "742").as_posix()
     assert cj["742"] != cj["743"].replace("743", "742")   # different results dirs stay distinct
+
+
+# ---------------------------------------------------------------------------
+# Archive probe (probe.py)
+# ---------------------------------------------------------------------------
+def _tar_bytes(members: dict, mode: str = "w") -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode=mode) as tf:
+        for name, data in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def _rar4_bytes(members: dict, main_flags: int = 0) -> bytes:
+    """A minimal stored RAR 4 archive (header CRCs included)."""
+    import struct
+    import zlib
+
+    def block(htype, flags, body, add=b""):
+        hdr = struct.pack("<BHH", htype, flags, 7 + len(body)) + body
+        return struct.pack("<H", zlib.crc32(hdr) & 0xFFFF) + hdr + add
+
+    out = b"Rar!\x1a\x07\x00" + block(0x73, main_flags, b"\x00" * 6)
+    for name, data in members.items():
+        nb = name.encode()
+        body = struct.pack("<IIBIIBBHI", len(data), len(data), 3, zlib.crc32(data), 0x00210000, 20, 0x30,
+                           len(nb), 0x81A4 << 16) + nb
+        out += block(0x74, 0x8000, body, data)
+    return out + block(0x7B, 0x4000, b"")
+
+
+def _probe(tmp_path, key, data, **kw):
+    from envision_eye_actionable.survey import probe
+    rid = "900"
+    fake = _FakeZenodo(rid, {key: data})
+    c = _client(tmp_path, fake)
+    kw.setdefault("min_bytes", 0)
+    return probe.probe_archive(c, rid, key, len(data), **kw), fake
+
+
+def _noise(n: int, seed: int = 0) -> bytes:
+    return np.random.default_rng(seed).integers(0, 256, n, dtype=np.uint8).tobytes()
+
+
+def test_probe_member_signal_follows_the_walker():
+    from envision_eye_actionable.survey.probe import member_signal
+    dicm = b"\0" * 128 + b"DICM" + b"\0" * 10
+    assert member_signal("a/b/scan.tif", 10, False) == "image"
+    assert member_signal("vol.nii.gz", 10, False) == "image"
+    assert member_signal("inner.zip", 10, False) == "nested"
+    assert member_signal("x.tif.gz", 10, False) == "nested"
+    assert member_signal("table.csv.gz", 10, False) == ""
+    assert member_signal("__MACOSX/._a.png", 10, False) == ""
+    assert member_signal("dir/._a.png", 10, True) == ""
+    assert member_signal("code/main.py", 10, True) == ""
+    # extensionless: only where the walker sniffs them (zip, tar), in its size range
+    assert member_signal("IM0001", 5000, False) == ""
+    assert member_signal("IM0001", 5000, True) == "noext"
+    assert member_signal("IM0001", 7, True) == ""                 # under the walker's sniff size
+    assert member_signal("IM0001", 80 << 20, True) == ""
+    assert member_signal("pkg/README", 5000, True) == ""
+    assert member_signal("IM0001", 5000, True, head=dicm) == "image"
+    assert member_signal("IM0001", 5000, True, head=b"x" * 200) == ""
+
+
+def test_probe_tar_hops_over_large_members(tmp_path):
+    big = _noise(3 << 20)
+    data = _tar_bytes({"raw/a.bin": big, "raw/b.bin": big, "docs/readme.txt": b"hi", "img/OD_1.png": _png_bytes()})
+    res, fake = _probe(tmp_path, "d.tar", data)
+    assert res.outcome == "images" and res.hit == "img/OD_1.png" and res.method == "tar_headers"
+    assert res.n_members == 4 and res.n_images == 1
+    assert res.bytes_used < len(data) // 4 and res.n_requests <= 5
+    assert all(rng for _, rng in fake.calls)                     # range reads only
+
+    neg = _tar_bytes({"raw/a.bin": big, "raw/b.bin": big, "docs/readme.txt": b"hi", "t.csv": b"1,2"})
+    res, _ = _probe(tmp_path, "n.tar", neg)
+    assert res.outcome == "no_images" and res.complete and res.n_members == 4
+    assert res.kind_counts["other"] == 4 and "docs/readme.txt" in res.names
+    assert res.bytes_used < len(neg) // 4
+    # one part of a split set is never proven empty
+    res, _ = _probe(tmp_path, "n.tar", neg, split=True)
+    assert res.outcome == "unknown" and not res.complete
+
+
+def test_probe_tar_limits_make_it_unknown(tmp_path):
+    big = _noise(1 << 20)
+    data = _tar_bytes({f"raw/{i}.bin": big for i in range(12)} | {"z.png": _png_bytes()})
+    res, _ = _probe(tmp_path, "d.tar", data, max_requests=3)
+    assert res.outcome == "unknown" and not res.complete and "request limit" in res.note
+    res, _ = _probe(tmp_path, "d.tar", data)                      # within the default limits
+    assert res.outcome == "images"
+
+
+def test_probe_tar_sniffs_extensionless_members(tmp_path):
+    dicm = b"\0" * 128 + b"DICM" + b"\0" * 400
+    res, _ = _probe(tmp_path, "d.tar", _tar_bytes({"series/IM0001": dicm}))
+    assert res.outcome == "images" and res.n_images == 1 and res.n_noext == 0
+    res, _ = _probe(tmp_path, "d.tar", _tar_bytes({"bin/tool": b"\x7fELF" + b"\0" * 400, "README": b"x" * 300}))
+    assert res.outcome == "no_images" and res.complete
+    # an extensionless PNG is an image too (the walker sniffs PNG, JPEG, TIFF, BMP)
+    res, _ = _probe(tmp_path, "p.tar", _tar_bytes({"scans/IMG0001": _png_bytes()}))
+    assert res.outcome == "images" and res.n_images == 1
+
+
+def test_probe_compressed_tar_streams_the_head(tmp_path):
+    pos = _tar_bytes({"a.txt": b"x" * 1000, "b/OD.tif": b"II*\0" + b"\0" * 100}, mode="w:gz")
+    res, fake = _probe(tmp_path, "d.tar.gz", pos)
+    assert res.outcome == "images" and res.method == "tar_stream" and res.n_requests == 1
+    neg = _tar_bytes({"a.txt": b"x" * 1000, "b.csv": b"1,2"}, mode="w:bz2")
+    res, _ = _probe(tmp_path, "d.tar.bz2", neg)
+    assert res.outcome == "no_images" and res.complete and res.bytes_used == len(neg)
+    # past the byte limit without an image: unknown, never no_images
+    big = _tar_bytes({f"n{i}.bin": _noise(400_000, i) for i in range(6)} | {"z.png": b"x"}, mode="w:gz")
+    res, _ = _probe(tmp_path, "d.tgz", big, stream_bytes=1 << 20)
+    assert res.outcome == "unknown" and not res.complete and "byte limit" in res.note
+    assert res.bytes_used <= 1 << 20
+
+
+def test_probe_7z_reads_the_end_header(tmp_path):
+    py7zr = pytest.importorskip("py7zr")
+    for name, members, want in (("p.7z", {"a/readme.txt": b"x" * 100, "a/img/OS.png": _png_bytes()}, "images"),
+                                ("n.7z", {"a/readme.txt": b"x" * 100, "b/data.csv": b"1,2\n" * 50}, "no_images")):
+        src = tmp_path / name
+        with py7zr.SevenZipFile(src, "w") as z:
+            for k, v in members.items():
+                z.writestr(v, k)
+            z.writestr(_noise(3 << 20), "a/zz_payload.bin")
+        data = src.read_bytes()
+        res, _ = _probe(tmp_path, name, data)
+        assert res.outcome == want, res.note
+        assert res.method == "7z_header" and res.complete
+        assert res.n_members == 3
+        assert res.bytes_used < len(data) // 2 and res.n_requests <= 4
+
+
+def test_probe_rar_walks_block_headers(tmp_path):
+    pytest.importorskip("rarfile")
+    big = _noise(2 << 20)
+    data = _rar4_bytes({"raw/a.bin": big, "raw/b.bin": big, "imgs/OD.jpg": b"\xff\xd8" + b"x" * 50})
+    res, _ = _probe(tmp_path, "d.rar", data)
+    assert res.outcome == "images" and res.method == "rar_headers" and res.hit == "imgs/OD.jpg"
+    assert res.bytes_used < len(data) // 2
+    neg = _rar4_bytes({"raw/a.bin": big, "raw/b.bin": big, "IM0001": b"\0" * 500})
+    res, _ = _probe(tmp_path, "n.rar", neg)
+    assert res.outcome == "no_images" and res.complete and res.n_members == 3   # rar: no noext sniff
+    # one part of a split set never proves the set empty
+    res, _ = _probe(tmp_path, "n.part1.rar", neg, split=True)
+    assert res.outcome == "unknown" and not res.complete
+    # the main header's volume flag says the same without the name
+    vol = _rar4_bytes({"raw/a.bin": big, "IM0001": b"\0" * 500}, main_flags=0x0001)
+    res, _ = _probe(tmp_path, "v.rar", vol)
+    assert res.outcome == "unknown" and "multi-volume" in res.note
+
+
+def test_probe_single_compressed_files(tmp_path):
+    import gzip
+    res, fake = _probe(tmp_path, "scan.tif.gz", gzip.compress(b"II*\0" + b"\0" * 200))
+    assert res.outcome == "images" and res.n_requests == 0 and not fake.calls
+    dicm = b"\0" * 128 + b"DICM" + _noise(5000)
+    res, _ = _probe(tmp_path, "IM0001.gz", gzip.compress(dicm))
+    assert res.outcome == "images" and res.method == "inner_sniff" and res.n_requests == 1
+    res, _ = _probe(tmp_path, "blob.gz", gzip.compress(_noise(5000)))
+    assert res.outcome == "no_images" and res.complete
+    res, _ = _probe(tmp_path, "inner.zip.gz", gzip.compress(b"PK"))
+    assert res.outcome == "unknown"
+
+
+def test_probe_record_skips_small_and_split_and_honours_record_limits(tmp_path):
+    from envision_eye_actionable.survey import probe
+    rid = "901"
+    neg = _tar_bytes({"a.txt": _noise(300_000)})
+    files = {"a.tar": neg, "b.tar": neg, "c.tar": neg, "s.part1.rar": b"Rar!" * 400, "s.part2.rar": b"Rar!",
+             "tiny.tar": _tar_bytes({"a.txt": b"x"})}
+    c = _client(tmp_path, _FakeZenodo(rid, files))
+    fl = [{"key": k, "size": len(v)} for k, v in files.items()]
+    out = probe.probe_record_archives(c, rid, fl, list(files), min_bytes=20_000, record_requests=2)
+    by = {r.key: r for r in out.results}
+    assert by["a.tar"].outcome == "no_images"
+    assert by["tiny.tar"].outcome == "not_probed" and "small" in by["tiny.tar"].note
+    assert out.stop == "record probe limit reached"
+    assert any(r.note == "record probe limit reached" for r in out.results)
+    assert "s.part2.rar" not in by                               # fragments follow their first part
+    assert by["s.part1.rar"].outcome in ("unknown", "not_probed")
+
+
+def test_process_record_skips_archives_probed_negative(tmp_path, monkeypatch):
+    pytest.importorskip("jsonschema")
+    from envision_eye_actionable.survey import probe
+    monkeypatch.setattr(probe, "MIN_PROBE_BYTES", 0)
+    rid = "902"
+    neg = _tar_bytes({"code/run.py": b"print(1)", "tables/t.csv": b"1,2", "Topcon_export.txt": b"x"},
+                     mode="w:gz")
+    files = {"code.tar.gz": neg, "readme.pdf": b"%PDF"}
+    s = _survey(tmp_path, _legacy(rid, files), files, rid)
+    row = s.process_record({"source_id": rid, "title": "T"})
+    assert row["status"] == "no_images_in_archives" and row["sampling_mode"] == "none"
+    assert row["n_archives_probed"] == 1 and row["n_archive_probe_no_images"] == 1
+    assert row["archive_probe_bytes_avoided"] == len(neg) and row["n_files_to_download"] == 0
+    assert row["archive_probes"][0]["outcome"] == "no_images"
+    assert row["file_kind_counts"]["other"] == 3 and row["n_archives_listed"] == 1
+    assert "Topcon" in row["manufacturer_hint_text"]              # member names are catalogued
+    assert all(rng for url, rng in s.zenodo.session.calls if url.endswith("/content"))   # no whole download
+    assert "n_weblinks" in row and row["dd_valid"]
+    ev = [json.loads(line) for line in s.events_path.read_text(encoding="utf-8").splitlines()]
+    assert any(e["event"] == "archive_probe" and e["archives"][0]["outcome"] == "no_images" for e in ev)
+
+    # a positive archive next to a negative one: only the positive one is downloaded
+    rid = "903"
+    pos = _tar_bytes({"ir/OD_1.png": _png_bytes(size=(64, 48)), "ir/OD_2.png": _png_bytes(size=(64, 48))})
+    files = {"code.tar.gz": neg, "ir.tar": pos}
+    (tmp_path / "b").mkdir()
+    s = _survey(tmp_path / "b", _legacy(rid, files), files, rid)
+    row = s.process_record({"source_id": rid, "title": "T"})
+    assert row["status"] == "ok" and row["n_classified"] == 2 and row["sampling_mode"] == "download"
+    assert row["n_archive_probe_images"] == 1 and row["n_archive_probe_no_images"] == 1
+    whole = [url for url, rng in s.zenodo.session.calls if not rng and url.endswith("/content")]
+    assert len(whole) == 1 and "ir.tar" in whole[0]
+    assert row["n_archives_listed"] == 2
+
+    # --no-archive-probe: downloaded whole as before, no_image_files
+    rid = "904"
+    files = {"code.tar.gz": neg}
+    (tmp_path / "c").mkdir()
+    s = _survey(tmp_path / "c", _legacy(rid, files), files, rid, archive_probe=False)
+    row = s.process_record({"source_id": rid, "title": "T"})
+    assert row["status"] == "no_image_files" and row["sampling_mode"] == "download"
+    assert row["archive_probe_enabled"] is False and "archive_probes" not in row
+
+
+def test_workbook_lists_archive_probes(tmp_path, monkeypatch):
+    pytest.importorskip("jsonschema")
+    pytest.importorskip("openpyxl")
+    from openpyxl import load_workbook
+
+    from envision_eye_actionable.survey import probe
+    from envision_eye_actionable.survey.excel import build_workbook
+    monkeypatch.setattr(probe, "MIN_PROBE_BYTES", 0)
+    rid = "905"
+    files = {"code.tar.gz": _tar_bytes({"a.csv": b"1"}, mode="w:gz")}
+    s = _survey(tmp_path, _legacy(rid, files), files, rid)
+    s._append_row(s.process_record({"source_id": rid, "title": "T"}))
+    build_workbook(s.results_path, tmp_path / "w.xlsx")
+    wb = load_workbook(tmp_path / "w.xlsx")
+    head = [c.value for c in wb["Archive_Probes"][1]]
+    got = dict(zip(head, [c.value for c in wb["Archive_Probes"][2]]))
+    assert got["Archive"] == "code.tar.gz" and got["Record status"] == "no_images_in_archives"
+    assert got["Outcome (images: downloaded; no_images: not downloaded; unknown: downloaded as before)"] == "no_images"
+    rec_head = [c.value for c in wb["Records"][1]]
+    assert "Download bytes avoided by the archive probe" in rec_head
+
+
+# ---------------------------------------------------------------------------
+# Format conversion (images.py), audit fixes
+# ---------------------------------------------------------------------------
+def test_tiff_over_budget_is_read_strided_not_refused(tmp_path):
+    """The 15116835 bug: a TIFF over the pixel cap was refused (too_large)
+    instead of being read at a reduced resolution."""
+    tifffile = pytest.importorskip("tifffile")
+    from envision_eye_actionable.survey.images import _strided_page
+    yy, xx = np.mgrid[0:200, 0:300]
+    arr = (yy * 300 + xx).astype(np.uint16)
+    for name, kw in (("strips.tif", {"rowsperstrip": 7}), ("tiles.tif", {"tile": (64, 64)})):
+        p = tmp_path / name
+        tifffile.imwrite(p, arr, **kw)
+        with tifffile.TiffFile(p) as tf:
+            got = _strided_page(tf.pages[0], 3)
+        assert np.array_equal(got, arr[::3, ::3]), name
+        ld = load_frame("raster", ".tif", None, p, max_pixels=10_000)
+        assert ld.image is not None and ld.error is None
+        assert "strided 1/3" in ld.facts["conversion"] and ld.image.size == (100, 67)
+        assert (ld.facts["rows"], ld.facts["cols"]) == (200, 300)
+    # float32 GeoTIFF, planar separate, with a -3.4e38 nodata border
+    band = np.linspace(0, 1, 200 * 300, dtype=np.float32).reshape(200, 300)
+    band2 = band * 2
+    band[:10] = band2[:10] = -3.4e38
+    p = tmp_path / "geo.tif"
+    tifffile.imwrite(p, np.stack([band, band2]), planarconfig="separate", photometric="minisblack")
+    with tifffile.TiffFile(p) as tf:
+        got = _strided_page(tf.pages[0], 4)
+    assert got.shape == (50, 75, 2) and np.array_equal(got[..., 1], band2[::4, ::4])
+    ld = load_frame("raster", ".tif", None, p, max_pixels=5_000)
+    assert ld.image is not None and "strided 1/4" in ld.facts["conversion"] and ld.facts.get("float")
+
+
+def test_single_strip_tiff_over_the_budget_is_viewed_or_refused_never_decoded_whole(tmp_path):
+    """ImageJ-style TIFFs hold the whole plane in one strip: decoding that
+    strip is decoding the plane. Uncompressed: strided through a view of
+    the file (or of the bytes in memory); compressed: too_large."""
+    tifffile = pytest.importorskip("tifffile")
+    from envision_eye_actionable.survey import images
+    yy, xx = np.mgrid[0:200, 0:300]
+    arr = (yy * 300 + xx).astype(np.uint16)
+    rgb = np.stack([arr, arr // 2, arr // 3], axis=-1).astype(np.uint16)
+    decoded = []
+    orig = images._strided_page
+    images._strided_page = lambda page, step: decoded.append(step) or orig(page, step)
+    try:
+        for name, data, kw in (("one.tif", arr, {}), ("big_endian.tif", arr, {"byteorder": ">"}),
+                               ("rgb.tif", rgb, {"photometric": "rgb"}),
+                               ("planar.tif", np.moveaxis(rgb, -1, 0), {"photometric": "rgb",
+                                                                        "planarconfig": "separate"})):
+            p = tmp_path / name
+            tifffile.imwrite(p, data, rowsperstrip=200, **kw)
+            with tifffile.TiffFile(p) as tf:
+                assert images._tiff_segment_bytes(tf.pages[0]) >= 200 * 300 * 2
+            want = arr[::3, ::3] if data is arr else rgb[::3, ::3]
+            for src in (None, p.read_bytes()):
+                ld = images._load_tiff(src, p, ".tif", max_pixels=10_000, max_bytes=50_000)
+                assert ld.image is not None and ld.error is None, (name, ld.error)
+                assert "uncompressed view" in ld.facts["conversion"] and "strided 1/3" in ld.facts["conversion"]
+                assert ld.image.size == (100, 67)
+            with tifffile.TiffFile(p) as tf:
+                got = images._contiguous_strided(tf, tf.pages[0], 3, None, p)
+            assert got.dtype.isnative and np.array_equal(got, want), name
+        assert decoded == []                      # no strip was decoded
+        # the same plane compressed in one strip: refused, not decoded
+        p = tmp_path / "zlib.tif"
+        tifffile.imwrite(p, arr, rowsperstrip=200, compression="zlib")
+        ld = images._load_tiff(None, p, ".tif", max_pixels=10_000, max_bytes=50_000)
+        assert ld.image is None and ld.error.startswith("too_large") and decoded == []
+        # many small strips under the budget: decoded strip by strip as before
+        p = tmp_path / "strips.tif"
+        tifffile.imwrite(p, arr, rowsperstrip=7, compression="zlib")
+        ld = images._load_tiff(None, p, ".tif", max_pixels=10_000, max_bytes=50_000)
+        assert ld.image is not None and decoded == [3]
+    finally:
+        images._strided_page = orig
+
+
+def test_array_to_rgb8_windows_in_place_within_a_memory_bound():
+    """A plane at the decode budget must not take 4x its size again in the
+    consumer: one float32 working copy plus bool masks."""
+    import tracemalloc
+    from envision_eye_actionable.survey.images import array_to_rgb8
+    rng = np.random.default_rng(1)
+    a = rng.normal(100, 20, (1500, 2000)).astype(np.float32)
+    a[:5] = -3.4e38                                  # nodata border
+    a[5, :10] = np.nan
+    ref = a.astype(np.float64)
+    ok = np.isfinite(ref) & (np.abs(ref) < 1e30)
+    lo, hi = np.percentile(ref[ok][:: max(1, ok.sum() // 1_000_000)], [0.5, 99.5])
+    want = np.clip((np.where(ok, ref, lo) - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)
+    tracemalloc.start()
+    try:
+        img = array_to_rgb8(a)
+        _cur, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    got = np.asarray(img)[..., 0]
+    assert np.abs(got.astype(int) - want.astype(int)).max() <= 2
+    assert (got[:5] == 0).all()                      # nodata goes to the low end
+    assert peak < 2.6 * a.nbytes, peak / a.nbytes
+    u16 = rng.integers(0, 4096, (1500, 2000)).astype(np.uint16)
+    tracemalloc.start()
+    try:
+        array_to_rgb8(u16)
+        _cur, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 5.0 * u16.nbytes, peak / u16.nbytes    # float32 copy (2x) + masks + sample + uint8 out
+
+
+def test_tiff_pyramid_level_and_middle_plane(tmp_path):
+    tifffile = pytest.importorskip("tifffile")
+    a0 = np.random.default_rng(0).integers(0, 255, (1500, 2400), dtype=np.uint8)
+    p = tmp_path / "pyr.tif"
+    with tifffile.TiffWriter(p) as tw:
+        tw.write(a0, subifds=2, tile=(256, 256))
+        for k in (2, 4):
+            tw.write(a0[::k, ::k], subfiletype=1, tile=(256, 256))
+    ld = load_frame("raster", ".tif", None, p)
+    # smallest level whose long side is at least 1024: 2400 -> 1200 (level 1)
+    assert ld.image.size == (1200, 750) and "pyramid level 1/3" in ld.facts["conversion"]
+    assert (ld.facts["full_rows"], ld.facts["full_cols"]) == (1500, 2400)
+    # a Z stack of same-shape pages gives its middle plane, not page 0
+    rng = np.random.default_rng(1)
+    stack = np.stack([np.clip(i * 50 + rng.integers(-5, 6, (40, 50)), 0, 255) for i in range(5)]).astype(np.uint8)
+    p = tmp_path / "stack.tif"
+    tifffile.imwrite(p, stack, imagej=True, metadata={"axes": "ZYX"})
+    ld = load_frame("raster", ".tif", None, p)
+    assert "Z=2/5" in ld.facts["conversion"] and ld.facts["frame_index"] == 2
+    assert abs(np.asarray(ld.image)[..., 0].astype(float).mean() - np.asarray(stack[2], float).mean()) < 30
+    assert ld.facts["frames"] == 5
+
+
+def test_native_mask_test_on_deep_integer_images():
+    from envision_eye_actionable.survey.images import array_to_rgb8, is_mask_like, native_mask_like
+    rng = np.random.default_rng(0)
+    real = (1000 + rng.integers(-30, 31, (120, 160))).astype(np.uint16)
+    real.ravel()[rng.choice(real.size, real.size // 50, replace=False)] = 65535    # 2% saturated
+    # the 8-bit test sees a few gray levels; the native values do not
+    assert is_mask_like(array_to_rgb8(real))
+    assert native_mask_like(real) is False
+    labels = (np.arange(120 * 160).reshape(120, 160) // 4000 % 4 * 1000).astype(np.uint16)
+    assert native_mask_like(labels) is True
+    assert native_mask_like(np.zeros((10, 10), np.uint8)) is None          # 8-bit: the 8-bit test applies
+    assert native_mask_like(np.zeros((10, 10, 3), np.uint16)) is None
+
+
+def test_deep_tiff_facts_use_the_native_mask_test(tmp_path):
+    tifffile = pytest.importorskip("tifffile")
+    rng = np.random.default_rng(0)
+    real = (1000 + rng.integers(-30, 31, (120, 160))).astype(np.uint16)
+    real.ravel()[rng.choice(real.size, real.size // 50, replace=False)] = 65535
+    p = tmp_path / "deep.tif"
+    tifffile.imwrite(p, real)
+    ld = load_frame("raster", ".tif", None, p)
+    assert ld.facts["mask_like"] is False and ld.facts["mask_test"] == "native"
+    buf = io.BytesIO()
+    Image.fromarray(real).save(buf, "PNG")                      # 16-bit PNG through PIL
+    ld = load_frame("raster", ".png", buf.getvalue(), None)
+    assert ld.facts["mask_like"] is False and ld.facts["mask_test"] == "native"
+
+
+def test_transparency_is_composited_over_white(tmp_path):
+    from envision_eye_actionable.survey.images import array_to_rgb8
+    im = Image.new("RGBA", (60, 40), (0, 0, 0, 0))
+    im.paste((200, 30, 30, 255), (20, 10, 40, 30))
+    buf = io.BytesIO()
+    im.save(buf, "PNG")
+    ld = load_frame("raster", ".png", buf.getvalue(), None)
+    assert ld.image.getpixel((0, 0)) == (255, 255, 255) and ld.image.getpixel((30, 20)) == (200, 30, 30)
+    arr = np.zeros((40, 60, 4), np.uint8)
+    arr[10:30, 20:40] = (200, 30, 30, 255)
+    out = array_to_rgb8(arr)
+    assert out.getpixel((0, 0)) == (255, 255, 255) and out.getpixel((30, 20)) == (200, 30, 30)
+
+
+def test_blank_frames_are_flagged():
+    ld = load_frame("raster", ".png", _png_bytes(size=(64, 48), plain=True), None)
+    assert ld.facts["blank"] is True
+    ld = load_frame("raster", ".png", _png_bytes(size=(64, 48)), None)
+    assert ld.facts["blank"] is False
+
+
+def test_svg_embedded_raster_and_sandboxed_render(tmp_path):
+    pytest.importorskip("resvg_py")
+    import base64
+    photo = _png_bytes(size=(80, 60))
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" '
+           f'height="100"><image width="80" height="60" xlink:href="data:image/png;base64,'
+           f'{base64.b64encode(photo).decode()}"/></svg>').encode()
+    ld = load_frame("vector", ".svg", svg, None)
+    assert ld.image.size == (80, 60) and ld.facts["conversion"] == "SVG embedded PNG image"
+    # a vector figure is rendered; a reference to a local file is removed
+    red = tmp_path / "red.png"
+    Image.new("RGB", (50, 50), (255, 0, 0)).save(red)
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="100" '
+           f'height="50"><rect width="100" height="50" fill="#0000ff"/><image width="100" height="50" '
+           f'preserveAspectRatio="none" xlink:href="{red.as_posix()}"/><image width="100" height="50" '
+           f'href="https://example.org/x.png"/></svg>').encode()
+    ld = load_frame("vector", ".svg", svg, None)
+    assert ld.image.size == (512, 256) and "rendered" in ld.facts["conversion"]
+    for xy in ((20, 20), (256, 128), (490, 240)):
+        assert ld.image.getpixel(xy) == (0, 0, 255)                # the rect, not the local red file
+
+
+def test_compressed_dicom_transfer_syntaxes_decode():
+    pydicom = pytest.importorskip("pydicom")
+    from pydicom.uid import JPEG2000Lossless, RLELossless
+    for uid in (RLELossless, JPEG2000Lossless):
+        ds = pydicom.dcmread(io.BytesIO(_dicom_bytes(frames=3, rows=64, cols=48)))
+        try:
+            ds.compress(uid)
+        except Exception as e:  # noqa: BLE001 - encoder plugin missing
+            pytest.skip(f"no encoder for {uid}: {e}")
+        buf = io.BytesIO()
+        ds.save_as(buf, enforce_file_format=True)
+        ld = load_frame("dicom", ".dcm", buf.getvalue(), None)
+        assert ld.image is not None, (uid, ld.error)
+        assert "frame 1/3" in ld.facts["conversion"] and str(uid.name) in ld.facts["source_format"]
+
+
+def test_arrays_pick_an_image_shaped_dataset(tmp_path):
+    from envision_eye_actionable.survey.images import plane_plan
+    vol = np.stack([np.full((128, 96), i * 1000, np.uint16) + np.arange(96, dtype=np.uint16) for i in range(10)])
+    np.save(tmp_path / "v.npy", vol)
+    ld = load_frame("array", ".npy", None, tmp_path / "v.npy")
+    assert ld.image is not None and ld.image.size == (96, 128) and "npy (10, 128, 96)" in ld.facts["conversion"]
+    np.savez(tmp_path / "z.npz", labels=np.arange(50), images=np.random.default_rng(0).random((4, 64, 80)))
+    ld = load_frame("array", ".npz", None, tmp_path / "z.npz")
+    assert ld.image is not None and "npz images" in ld.facts["conversion"]
+    # a name hint beats a larger plane: oct/bscan over raw/table
+    h5py = pytest.importorskip("h5py")
+    with h5py.File(tmp_path / "d.h5", "w") as f:
+        f["raw/table"] = np.random.default_rng(1).random((300, 400))
+        f["oct/bscan"] = np.random.default_rng(2).random((5, 128, 100)).astype(np.float32)
+    ld = load_frame("array", ".h5", None, tmp_path / "d.h5")
+    assert "oct/bscan" in ld.facts["conversion"] and ld.image.size == (100, 128)
+    # MAT v7.3 (HDF5 after a 512-byte header) and MAT v5
+    with h5py.File(tmp_path / "m73.mat", "w", userblock_size=512) as f:
+        f["img"] = np.random.default_rng(3).random((70, 90))
+    ld = load_frame("array", ".mat", None, tmp_path / "m73.mat")
+    assert ld.image is not None and ld.facts["source_format"] == "MAT v7.3 (HDF5)"
+    scipy_io = pytest.importorskip("scipy.io")
+    scipy_io.savemat(tmp_path / "m5.mat", {"img": np.random.default_rng(4).integers(0, 255, (100, 80)).astype(np.uint8),
+                                           "vec": np.arange(500)})
+    ld = load_frame("array", ".mat", None, tmp_path / "m5.mat")
+    assert ld.image is not None and "mat img" in ld.facts["conversion"] and ld.facts["source_format"] == "MAT v5"
+    # signals, tables and feature matrices are not images
+    np.save(tmp_path / "sig.npy", np.random.default_rng(5).random((4096, 64)))
+    ld = load_frame("array", ".npy", None, tmp_path / "sig.npy")
+    assert ld.image is None and "not image shaped" in ld.error
+    assert plane_plan((4096, 64)) is None and plane_plan((40, 40)) is None and plane_plan((64, 64)) is not None
+    assert plane_plan((3, 200, 300))[1] == (200, 300)
+
+
+def test_network_weights_are_not_images(tmp_path):
+    """A Keras model .h5 (seen live: a record's model file classified as
+    OCTA) and layer parameter tensors elsewhere are never rendered."""
+    from envision_eye_actionable.survey.runner import unread_reason
+    h5py = pytest.importorskip("h5py")
+    rng = np.random.default_rng(0)
+    with h5py.File(tmp_path / "keras.h5", "w") as f:
+        f.attrs["keras_version"] = "2.4.0"
+        f["layers/dense/vars/0"] = rng.random((512, 256)).astype(np.float32)   # no parameter-like name
+    ld = load_frame("array", ".h5", None, tmp_path / "keras.h5")
+    assert ld.image is None and "model weights" in ld.error
+    assert unread_reason(ld.error) == "not_image_shaped"
+    # a group model_weights alone marks the file too
+    with h5py.File(tmp_path / "weights_only.h5", "w") as f:
+        f["model_weights/conv/conv/kernel:0"] = rng.random((3, 3, 64, 128)).astype(np.float32)
+        f["model_weights/dense/w"] = rng.random((300, 200)).astype(np.float32)
+    ld = load_frame("array", ".h5", None, tmp_path / "weights_only.h5")
+    assert ld.image is None and "model weights" in ld.error
+    # parameter tensors in a plain file are skipped; an image next to them is still read
+    with h5py.File(tmp_path / "mixed.h5", "w") as f:
+        f["encoder/conv1/weight"] = rng.random((256, 256)).astype(np.float32)
+        f["encoder/bn1/running_mean"] = rng.random((128, 128)).astype(np.float32)
+        f["sample"] = rng.random((70, 90)).astype(np.float32)
+    ld = load_frame("array", ".h5", None, tmp_path / "mixed.h5")
+    assert ld.image is not None and "hdf5 sample" in ld.facts["conversion"], ld.facts
+    with h5py.File(tmp_path / "params.h5", "w") as f:
+        f["layer1/weight"] = rng.random((256, 256)).astype(np.float32)
+        f["layer1/bias"] = rng.random((128, 128)).astype(np.float32)
+    ld = load_frame("array", ".h5", None, tmp_path / "params.h5")
+    assert ld.image is None and "no image-shaped dataset among 2" in ld.error
+    np.savez(tmp_path / "w.npz", fc_weight=rng.random((200, 200)), fc_bias=rng.random((100, 100)))
+    ld = load_frame("array", ".npz", None, tmp_path / "w.npz")
+    assert ld.image is None, ld.facts
+    # image names that merely contain a parameter word are still images
+    with h5py.File(tmp_path / "imgs.h5", "w") as f:
+        f["weighted_images"] = rng.random((80, 80)).astype(np.float32)
+    ld = load_frame("array", ".h5", None, tmp_path / "imgs.h5")
+    assert ld.image is not None
+
+
+def test_arrays_over_the_budget_are_strided(tmp_path):
+    arr = np.random.default_rng(0).random((600, 800)).astype(np.float32)
+    np.save(tmp_path / "big.npy", arr)
+    ld = load_frame("array", ".npy", None, tmp_path / "big.npy", max_pixels=100_000)
+    assert ld.image is not None and "strided 1/3" in ld.facts["conversion"] and ld.image.size == (267, 200)
+
+
+def test_video_frames_are_averaged(tmp_path):
+    imageio_ffmpeg = pytest.importorskip("imageio_ffmpeg")
+    vp = tmp_path / "clip.mp4"
+    w = imageio_ffmpeg.write_frames(str(vp), (64, 48), fps=10, macro_block_size=1)
+    w.send(None)
+    rng = np.random.default_rng(0)
+    for i in range(30):
+        w.send(np.clip(i * 8 + rng.integers(-5, 6, (48, 64, 3)), 0, 255).astype(np.uint8).tobytes())
+    w.close()
+    ld = load_frame("video", ".mp4", None, vp)
+    assert ld.image is not None and len(ld.frames) == 2, ld.error
+    assert ld.facts["duration_s"] > 2 and "25%" in ld.facts["conversion"]
+    means = [np.asarray(im, float).mean() for im in (ld.frames[0], ld.image, ld.frames[1])]
+    assert means[0] < means[1] < means[2]                          # 25%, 50%, 75% of the clip
+
+
+def _mhd_pair(tmp_path, name="vol"):
+    sitk = pytest.importorskip("SimpleITK")
+    arr = np.stack([np.full((64, 80), i * 20, np.uint8) + np.arange(80, dtype=np.uint8) for i in range(5)])
+    img = sitk.GetImageFromArray(arr)
+    p = tmp_path / f"{name}.mhd"
+    sitk.WriteImage(img, str(p), useCompression=False)
+    return p, tmp_path / f"{name}.raw"
+
+
+def test_volume_header_pairs_are_read_together(tmp_path):
+    hdr, raw = _mhd_pair(tmp_path)
+    assert raw.exists()
+    ld = load_frame("volume_pair", ".mhd", None, hdr)
+    assert ld.image is not None and ld.image.size == (80, 64) and ld.facts["source_format"] == "MHD"
+    # inside a zip and a tar: header and data member are extracted together
+    zp = tmp_path / "pairs.zip"
+    with zipfile.ZipFile(zp, "w") as zf:
+        zf.write(hdr, "scans/vol.mhd")
+        zf.write(raw, "scans/vol.raw")
+        zf.writestr("scans/lone.mhd", hdr.read_bytes())
+    tp = tmp_path / "pairs.tar"
+    with tarfile.open(tp, "w") as tf:
+        tf.add(raw, "scans/vol.raw")                     # data member first
+        tf.add(hdr, "scans/vol.mhd")
+    for arch in (zp, tp):
+        w = RecordWalker(scratch=tmp_path / f"s_{arch.suffix[1:]}")
+        w.add_file(arch, arch.name)
+        pair = [e for e in w.entries if e.member.endswith("vol.mhd")][0]
+        assert pair.kind == "volume_pair" and pair.companion == "scans/vol.raw"
+        assert w.kind_counts["volume_data"] == 1
+        got = {}
+        for e, data, path, err in w.read_entries(w.entries):
+            got[e.member] = load_frame(e.kind, e.ext, data, path) if not err else err
+        assert got["scans/vol.mhd"].image is not None, (arch, got["scans/vol.mhd"])
+        if "scans/lone.mhd" in got:
+            lone = got["scans/lone.mhd"]
+            assert isinstance(lone, str) or lone.image is None
+
+
+def test_analyze_pair_and_mrc(tmp_path):
+    nib = pytest.importorskip("nibabel")
+    arr = np.random.default_rng(0).integers(0, 1000, (70, 60, 4)).astype(np.int16)
+    nib.save(nib.AnalyzeImage(arr, np.eye(4)), str(tmp_path / "a.hdr"))
+    assert (tmp_path / "a.img").exists()
+    ld = load_frame("volume_pair", ".hdr", None, tmp_path / "a.hdr")
+    assert ld.image is not None and ld.facts["source_format"] == "ANALYZE"
+    (tmp_path / "b.hdr").write_bytes((tmp_path / "a.hdr").read_bytes())      # header without data
+    ld = load_frame("volume_pair", ".hdr", None, tmp_path / "b.hdr")
+    assert ld.image is None and "companion" in ld.error
+    mrcfile = pytest.importorskip("mrcfile")
+    with mrcfile.new(str(tmp_path / "m.mrc")) as m:
+        m.set_data(np.random.default_rng(1).random((6, 70, 90)).astype(np.float32))
+    ld = load_frame("microscopy", ".mrc", None, tmp_path / "m.mrc")
+    assert ld.image is not None and ld.image.size == (90, 70)
+
+
+def _heidelberg_vol(path, size_x=64, n=3, size_z=48, slo=32, bhdr=456):
+    import struct
+    hdr = bytearray(2048)
+    hdr[:11] = b"HSF-OCT-103"
+    struct.pack_into("<3i", hdr, 12, size_x, n, size_z)
+    struct.pack_into("<2i", hdr, 48, slo, slo)
+    struct.pack_into("<i", hdr, 100, bhdr)
+    rng = np.random.default_rng(0)
+    body = rng.integers(0, 255, slo * slo, dtype=np.uint8).tobytes()
+    for i in range(n):
+        b = (rng.random((size_z, size_x)) * (i + 1) * 0.1).astype("<f4")
+        b[0, 0] = 3.4e38                                    # invalid pixel marker
+        body += b"\0" * bhdr + b.tobytes()
+    path.write_bytes(bytes(hdr) + body)
+
+
+def test_vendor_vol_gives_a_bscan_and_a_fundus_view(tmp_path):
+    p = tmp_path / "scan.vol"
+    _heidelberg_vol(p)
+    ld = load_frame("vendor_oct", ".vol", None, p)
+    assert ld.image is not None and ld.image.size == (64, 48), ld.error
+    assert ld.facts["make"] == "Heidelberg Engineering" and ld.facts["frames"] == 3
+    assert (ld.facts["rows"], ld.facts["cols"]) == (48, 64)
+    assert "middle B-scan 1/3" in ld.facts["conversion"]
+    assert [v[0] for v in ld.views] == ["fundus"] and ld.views[0][1].size == (32, 32)
+    (tmp_path / "x.sdb").write_bytes(b"\0" * 100)
+    ld = load_frame("vendor_oct", ".sdb", None, tmp_path / "x.sdb")
+    assert ld.image is None and "catalogued" in ld.error
+
+
+def test_noext_members_are_sniffed_for_images_and_bare_dicom(tmp_path):
+    pydicom = pytest.importorskip("pydicom")
+    from envision_eye_actionable.survey.constants import sniff_kind
+    # a DICOM data set without the 128-byte preamble (ACR-NEMA style)
+    ds = pydicom.dcmread(io.BytesIO(_dicom_bytes(frames=1)))
+    buf = io.BytesIO()
+    ds.preamble = None
+    ds.file_meta.TransferSyntaxUID = pydicom.uid.ImplicitVRLittleEndian
+    pydicom.dcmwrite(buf, ds, enforce_file_format=False, implicit_vr=True, little_endian=True)
+    bare = buf.getvalue()
+    assert bare[:2] in (b"\x08\x00", b"\x02\x00") and sniff_kind(bare[:132]) == ("dicom", ".dcm")
+    assert sniff_kind(_png_bytes()[:132]) == ("raster", ".png")
+    assert sniff_kind(b"hello world, this is a readme" * 5) is None
+    zp = tmp_path / "n.zip"
+    with zipfile.ZipFile(zp, "w") as zf:
+        zf.writestr("s/IMG0001", _png_bytes())
+        zf.writestr("s/IM0002", bare)
+        zf.writestr("s/README", b"text " * 50)
+    w = RecordWalker(scratch=tmp_path / "s")
+    w.add_file(zp, "n.zip")
+    kinds = {e.member: (e.kind, e.ext) for e in w.entries}
+    assert kinds == {"s/IMG0001": ("raster", ".png"), "s/IM0002": ("dicom", ".dcm")}
+    assert w.member_ext_counts["(none)"] == 3 and sum(w.member_ext_counts.values()) == 3
+
+
+def test_zip_members_at_wrapped_offsets_are_found(tmp_path):
+    """4005629: a zip over 4 GiB without ZIP64 records; zipfile shifts every
+    member offset by 4 GiB and members in the first 4 GiB fail."""
+    from envision_eye_actionable.survey.archives import open_zip_member, wrapped_offsets
+    assert wrapped_offsets(5 << 32, 7 << 32) == [4 << 32, 3 << 32, 2 << 32, 1 << 32, 0, 6 << 32]
+    data = _zip_bytes({"a/OD.png": _png_bytes(), "b/OS.png": _png_bytes(color=(10, 200, 10))})
+    zf = zipfile.ZipFile(io.BytesIO(data))
+    info = zf.getinfo("b/OS.png")
+    info.header_offset += 1 << 32                            # what the wrapped central directory gives
+    with pytest.raises(Exception):
+        zf.open(info).read()
+    with open_zip_member(zf, info) as fp:
+        assert fp.read() == _png_bytes(color=(10, 200, 10))
+
+
+def test_remote_member_at_wrapped_offset_and_deflate64(tmp_path, monkeypatch):
+    import random
+
+    from envision_eye_actionable.survey import remote, zenodo
+    monkeypatch.setattr(zenodo.time, "sleep", lambda s: None)       # the 500 retries back off
+    data = _zip_bytes({"a/OD.png": _png_bytes(), "b/OS.png": _png_bytes(color=(10, 200, 10))})
+    fake = _FakeZenodo("81", {"x.zip": data}, listing_status=500)      # container API fails: range path
+    c = _client(tmp_path, fake)
+    lst = remote.list_zip(c, "81", "x.zip", len(data))
+    assert lst.container_failed and lst.source == "range"
+    rz = remote.RangeZips(c, "81")
+    _, zf = rz.get("x.zip", len(data))
+    for i in zf.infolist():
+        i.header_offset += 1 << 32
+    m = next(x for x in lst.members if x.name == "b/OS.png")
+    ok, err = remote.fetch_member(c, "81", lst, m, tmp_path / "o.png", len(data), rz)
+    assert ok, err
+    assert (tmp_path / "o.png").read_bytes() == _png_bytes(color=(10, 200, 10))
+    # Deflate64 members (4969418), streamed through inflate64
+    from envision_eye_actionable.survey.archives import SEVEN_ZIP
+    if not SEVEN_ZIP:
+        pytest.skip("7z binary needed to write a Deflate64 zip")
+    import subprocess
+    src = tmp_path / "d64"
+    src.mkdir()
+    payload = (_png_bytes(size=(200, 150)) * 20)
+    (src / "OD.png").write_bytes(payload)
+    zp = tmp_path / "d64.zip"
+    subprocess.run([SEVEN_ZIP, "a", "-tzip", "-mm=Deflate64", str(zp), str(src / "OD.png")], check=True,
+                   capture_output=True)
+    d64 = zp.read_bytes()
+    assert zipfile.ZipFile(zp).infolist()[0].compress_type == 9
+    fake = _FakeZenodo("82", {"d.zip": d64}, listing_status=500)
+    c = _client(tmp_path / "c2", fake)
+    res = remote.sample_remote_zips(c, "82", [{"key": "d.zip", "size": len(d64)}], tmp_path / "r", 5,
+                                    random.Random(0))
+    assert len(res.fetched) == 1 and not res.failures, res.failures
+    assert res.fetched[0][0].read_bytes() == payload
+
+
+def test_remote_member_cap_is_on_the_transfer_and_compressible_members_use_range(tmp_path, monkeypatch):
+    """4943680: 794 MB TIFF stacks in a 188 MB zip were never sampled (the
+    cap was on the uncompressed size)."""
+    import random
+
+    from envision_eye_actionable.survey import remote
+    big_flat = b"II*\x00" + bytes(3 << 20)                  # 3 MB, compresses to a few KB
+    data = _zip_bytes({"stack/LegStack.tif": big_flat})
+    fake = _FakeZenodo("83", {"x.zip": data})
+    c = _client(tmp_path, fake)
+    monkeypatch.setattr(remote, "COMPRESSED_PREFER_BYTES", 1 << 20)
+    res = remote.sample_remote_zips(c, "83", [{"key": "x.zip", "size": len(data)}], tmp_path / "r", 5,
+                                    random.Random(0), max_member_bytes=1 << 20)
+    assert res.n_members_skipped_oversize == 0 and len(res.fetched) == 1, res.failures
+    assert res.fetched[0][0].stat().st_size == len(big_flat)
+    assert not any("/container/" in url for url, _ in fake.calls)       # moved compressed, by range
+    assert res.bytes_received < 1 << 20
+
+
+def test_zenodo_token_goes_to_zenodo_only_and_is_never_shown(tmp_path, monkeypatch):
+    import requests
+
+    from envision_eye_actionable.survey.zenodo import ZenodoClient, load_token
+    secret = "tok-" + "x" * 20
+    tf = tmp_path / "token"
+    tf.write_text(secret + "\n", encoding="utf-8")
+    monkeypatch.delenv("ZENODO_TOKEN", raising=False)
+    assert load_token(None) is None and load_token(tf) == secret
+    monkeypatch.setenv("ZENODO_TOKEN", "from-env")
+    assert load_token(tf) == "from-env"
+    c = ZenodoClient(tmp_path / "cache", None, token=secret)
+    zen = c.session.prepare_request(requests.Request("GET", "https://zenodo.org/api/records/1"))
+    other = c.session.prepare_request(requests.Request("GET", "https://example.org/data.zip"))
+    assert zen.headers["Authorization"] == f"Bearer {secret}"
+    assert "Authorization" not in other.headers
+    assert secret not in repr(c.session.auth) and secret not in str(vars(c).get("session").auth)
+    assert ZenodoClient(tmp_path / "cache2", None).session.auth is None
+
+
+def test_rate_limit_remaining_header_pauses_requests(tmp_path):
+    import time as _time
+    c = _client(tmp_path, _FakeZenodo("1", {}))
+    c.observe(_HttpResp(200, headers={"X-RateLimit-Remaining": "50", "X-RateLimit-Reset": str(_time.time() + 30)}))
+    assert c._not_before <= _time.monotonic()
+    c.observe(_HttpResp(200, headers={"X-RateLimit-Remaining": "2", "X-RateLimit-Reset": str(_time.time() + 30)}))
+    assert 20 < c._not_before - _time.monotonic() <= 31
+
+
+class _NegClf:
+    """Every image NEG with p=0.95 (a record of graphics)."""
+
+    def predict(self, batch):
+        p = np.full((len(batch), 7), 0.05 / 6, np.float32)
+        p[:, 6] = 0.95
+        return p
+
+
+def test_mask_like_graphics_with_argmax_neg_keep_the_model_label(tmp_path):
+    """38 of the 65 mask_dominated records were plots, word clouds and logos:
+    flagged by the pixel check, called NEG by the model."""
+    pytest.importorskip("jsonschema")
+    rid = "750"
+    files = {"figs.zip": _zip_bytes({f"fig/{i}.png": _mask_png(levels=(0, 90, 200)) for i in range(6)})}
+    s = _survey(tmp_path, _legacy(rid, files), files, rid, remote_cap=50)
+    s.clf = _NegClf()
+    row = s.process_record({"source_id": rid, "title": "T"})
+    assert row["status"] == "no_eye_images", row.get("error")
+    assert row["n_MASK"] == 0 and row["n_NEG"] == 6 and row["n_mask_like_veto"] == 6
+    assert row["mask_dominated"] is False
+    import gzip
+    preds = [json.loads(x) for x in gzip.open(s.cfg.out_dir / "predictions" / f"{rid}.jsonl.gz", "rt")]
+    assert all(p["mask_like_veto"] and p["label"] == "NEG" for p in preds)
+
+
+def test_mask_exemption_needs_a_confident_non_octa_class():
+    from envision_eye_actionable.survey.runner import mask_exempt_class
+    cfp = [{"cls": "CFP", "conf": 0.82}] * 10
+    assert mask_exempt_class(cfp) == "CFP"
+    assert mask_exempt_class(cfp[:9]) is None                                      # too few
+    assert mask_exempt_class([{"cls": "CFP", "conf": 0.7}] * 20) is None           # not confident
+    assert mask_exempt_class([{"cls": "OCTA", "conf": 0.95}] * 50) is None         # missed masks look OCTA
+    assert mask_exempt_class(cfp + [{"cls": "IR", "conf": 0.9}] * 12) == "IR"      # the larger class
+
+
+def test_statuses_split_no_image_files_and_images_unreadable(tmp_path):
+    pytest.importorskip("jsonschema")
+    rid = "760"
+    files = {"broken.png": b"\x89PNG\r\n\x1a\n" + b"\0" * 200, "notes.csv": b"a,b"}
+    s = _survey(tmp_path, _legacy(rid, files), files, rid)
+    row = s.process_record({"source_id": rid, "title": "T"})
+    assert row["status"] == "images_unreadable", row.get("error")
+    assert row["n_pixel_files_unread_by_reason"] == {"decode_error": 1}
+    assert row["member_ext_counts"] == {}                      # no archive members
+    import gzip
+    pred = json.loads(gzip.open(s.cfg.out_dir / "predictions" / f"{rid}.jsonl.gz", "rt").readline())
+    assert pred["reason"] == "decode_error" and pred["path"] == "broken.png"
+    # blank frames only: images_unreadable, reason blank
+    rid = "761"
+    files = {"b.zip": _zip_bytes({f"x/{i}.png": _png_bytes(size=(64, 48), plain=True) for i in range(3)})}
+    (tmp_path / "b").mkdir()
+    s = _survey(tmp_path / "b", _legacy(rid, files), files, rid)
+    row = s.process_record({"source_id": rid, "title": "T"})
+    assert row["status"] == "images_unreadable" and row["n_blank"] == 3 and row["n_classified"] == 0
+    assert row["n_pixel_files_unread_by_reason"] == {"blank": 3}
+    # nothing pixel-bearing listed
+    rid = "762"
+    files = {"notes.csv": b"a,b", "paper.pdf": b"%PDF"}
+    (tmp_path / "c").mkdir()
+    s = _survey(tmp_path / "c", _legacy(rid, files), files, rid)
+    assert s.process_record({"source_id": rid, "title": "T"})["status"] == "no_image_files"
+
+
+def test_records_classify_converted_formats(tmp_path):
+    """A record mixing a VOL file (B-scan plus fundus view), a volume pair and
+    an array: every one converted, summarised per record."""
+    pytest.importorskip("jsonschema")
+    rid = "770"
+    _heidelberg_vol(tmp_path / "scan.vol")
+    (tmp_path / "v").mkdir()
+    hdr, raw = _mhd_pair(tmp_path / "v")
+    buf = io.BytesIO()
+    np.save(buf, np.random.default_rng(0).random((3, 90, 70)))
+    files = {"scan.vol": (tmp_path / "scan.vol").read_bytes(), "vol.mhd": hdr.read_bytes(),
+             "vol.raw": raw.read_bytes(), "stack.npy": buf.getvalue()}
+    (tmp_path / "run").mkdir()
+    s = _survey(tmp_path / "run", _legacy(rid, files), files, rid)
+    row = s.process_record({"source_id": rid, "title": "T"})
+    assert row["status"] == "ok", (row.get("error"), row.get("load_error_top"))
+    assert row["n_classified"] == 4                           # vol, vol#fundus, mhd pair, npy
+    assert set(row["formats_classified"]) == {"Heidelberg VOL", "MHD", "NPY"}
+    import gzip
+    preds = [json.loads(x) for x in gzip.open(s.cfg.out_dir / "predictions" / f"{rid}.jsonl.gz", "rt")]
+    assert {p["path"] for p in preds} == {"scan.vol", "scan.vol#fundus", "vol.mhd", "stack.npy"}
+    assert all(p.get("conversion") for p in preds)
+
+
+def test_series_of_large_top_level_images_is_sampled():
+    import random
+
+    from envision_eye_actionable.survey.runner import sample_series
+    big = [{"key": f"landcover_{i:03d}.tif", "size": 900 << 20} for i in range(8)]
+    small = [{"key": f"thumb_{i:03d}.tif", "size": 1 << 20} for i in range(8)]
+    other = [{"key": "data.tar", "size": 900 << 20}]
+    keep, rest = sample_series(big + small + other, 3, 64 << 20, random.Random(0))
+    assert len(rest) == 5 and all(f["key"].startswith("landcover_") for f in rest)
+    assert sum(1 for f in keep if f["key"].startswith("landcover_")) == 3
+    assert all(f in keep for f in small + other)
+    assert sample_series(big, 0, 64 << 20, random.Random(0)) == (big, [])
+
+
+def test_split_sets_are_joined_and_zstd_tars_read(tmp_path):
+    pytest.importorskip("jsonschema")
+    zstandard = pytest.importorskip("zstandard")
+    rid = "780"
+    tar = _tar_bytes({"img/OD.png": _png_bytes(), "img/OS.png": _png_bytes(color=(20, 90, 200))})
+    half = len(tar) // 2
+    files = {"scans.tar.partaa": tar[:half], "scans.tar.partab": tar[half:]}
+    s = _survey(tmp_path, _legacy(rid, files), files, rid)
+    row = s.process_record({"source_id": rid, "title": "T"})
+    assert row["n_classified"] == 2 and row["status"] == "ok", (row.get("error"), row.get("walk_error_detail"))
+    assert "2 parts joined" in row["split_join_detail"]
+    # .tar.zst: walked and probed
+    zst = zstandard.ZstdCompressor().compress(tar)
+    w = RecordWalker(scratch=tmp_path / "zs")
+    (tmp_path / "x.tar.zst").write_bytes(zst)
+    w.add_file(tmp_path / "x.tar.zst", "x.tar.zst")
+    assert len(w.entries) == 2
+    got = [load_frame(e.kind, e.ext, d, p) for e, d, p, err in w.read_entries(w.entries)]
+    assert all(g.image is not None for g in got)
+    res, _ = _probe(tmp_path, "x.tar.zst", zst)
+    assert res.outcome == "images" and res.method == "tar_stream"
+    from envision_eye_actionable.survey.constants import file_kind, is_fragment, split_first, split_stem
+    assert file_kind("x.tar.001") == "archive" and is_fragment("x.tar.002") and split_first("x.zip.partaa")
+    assert is_fragment("x.zip.partab") and split_stem("x.zip.partab") == "x.zip" and file_kind("x.part01") == "archive"
+
+
+def test_remote_volume_pairs_fetch_the_data_member(tmp_path):
+    import random
+
+    from envision_eye_actionable.survey import remote
+    (tmp_path / "v").mkdir()
+    hdr, raw = _mhd_pair(tmp_path / "v")
+    data = _zip_bytes({"ct/vol.mhd": hdr.read_bytes(), "ct/vol.raw": raw.read_bytes(), "ct/notes.txt": b"x"})
+    c = _client(tmp_path, _FakeZenodo("84", {"x.zip": data}))
+    res = remote.sample_remote_zips(c, "84", [{"key": "x.zip", "size": len(data)}], tmp_path / "r", 5,
+                                    random.Random(0))
+    assert len(res.fetched) == 1 and not res.failures, res.failures
+    path, disp = res.fetched[0]
+    assert disp == "x.zip!/ct/vol.mhd" and (path.parent / "vol.raw").exists()
+    ld = load_frame("volume_pair", ".mhd", None, path)
+    assert ld.image is not None, ld.error
+    assert res.member_ext_counts == {".mhd": 1, ".raw": 1, ".txt": 1}
+
+
+def _thorlabs_oct(path, intensity=True):
+    """A Thorlabs .oct as the instrument writes it: a zip with Header.xml and
+    data\*.data members named with backslashes."""
+    rng = np.random.default_rng(0)
+    video = rng.integers(0, 255, (48, 64, 4), dtype=np.uint8)
+    if not intensity:
+        video[..., 3] = 255                                      # interleaved BGRA (else: planes)
+    files = {"data\\VideoImage.data": video.tobytes()}
+    # SizeZ is the row length and SizeX the row count (as in a real file)
+    df = ['<DataFile Type="Colored" SizeZ="64" SizeX="48" BytesPerPixel="4">data\\VideoImage.data</DataFile>']
+    if intensity:
+        vol = rng.random((5, 80, 60)).astype("<f4")             # SizeY x SizeX x SizeZ, z fastest
+        vol[2] += 3.0                                            # the middle B-scan is brighter
+        files["data\\Intensity.data"] = vol.tobytes()
+        df.append('<DataFile Type="Real" SizeZ="60" SizeX="80" SizeY="5" BytesPerPixel="4">'
+                  'data\\Intensity.data</DataFile>')
+    else:
+        z = np.arange(256)
+        phase = rng.uniform(0, 2 * np.pi, (300, 1))             # a moving sample: the mean spectrum is flat
+        spec = 1000 + 200 * np.cos(2 * np.pi * z[None, :] * 20 / 256 + phase) + rng.integers(0, 5, (300, 256))
+        for i in range(3):
+            files[f"data\\Spectral{i}.data"] = spec.astype("<u2").tobytes()
+            df.append(f'<DataFile Type="Raw" SizeZ="256" SizeX="300" BytesPerPixel="2">data\\Spectral{i}.data'
+                      f'</DataFile>')
+    files["Header.xml"] = ('<?xml version="1.0"?><Ocity><DataFiles>' + "".join(df)
+                           + "</DataFiles></Ocity>").encode()
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as zf:
+        for k, v in files.items():
+            zf.writestr(k, v)
+
+
+def test_thorlabs_oct_intensity_and_raw_spectra(tmp_path):
+    p = tmp_path / "a.oct"
+    _thorlabs_oct(p)
+    ld = load_frame("vendor_oct", ".oct", None, p)
+    assert ld.image is not None and ld.image.size == (80, 60), ld.error
+    assert ld.facts["make"] == "Thorlabs" and "intensity B-scan 2/5" in ld.facts["conversion"]
+    assert ld.views and ld.views[0][1].size == (64, 48)
+    p = tmp_path / "b.oct"
+    _thorlabs_oct(p, intensity=False)
+    ld = load_frame("vendor_oct", ".oct", None, p)
+    assert ld.image is not None and "raw spectra FFT (300 A-scans of spectral file 1/3)" in ld.facts["conversion"]
+    assert ld.views[0][1].size == (64, 48) and not ld.views[0][2]["rgb_is_gray"]    # BGRA read as color
+    col = np.asarray(ld.image)[..., 0].astype(float).mean(axis=1)
+    assert abs(int(col.argmax()) - 19) <= 1                      # the reflector at depth bin 20
+    (tmp_path / "fire.fds").write_text("&HEAD CHID='x' /\n" * 20)
+    ld = load_frame("vendor_oct", ".fds", None, tmp_path / "fire.fds")
+    assert ld.image is None and "wrong_format" in ld.error
+
+
+def _rar5_bytes(members: dict, archive_flags: int = 0, encrypted: bool = False) -> bytes:
+    """A minimal stored RAR 5 archive (header CRCs included)."""
+    import zlib
+
+    def vint(n):
+        out = b""
+        while True:
+            b = n & 0x7F
+            n >>= 7
+            out += bytes([b | (0x80 if n else 0)])
+            if not n:
+                return out
+
+    def block(htype, hflags, body, data=b""):
+        head = vint(htype) + vint(hflags) + (vint(len(data)) if hflags & 0x2 else b"") + body
+        return (zlib.crc32(vint(len(head)) + head) & 0xFFFFFFFF).to_bytes(4, "little") + vint(len(head)) + head + data
+
+    out = b"Rar!\x1a\x07\x01\x00"
+    if encrypted:
+        out += block(4, 0, vint(0) + vint(0) + b"\0" * 16)
+    out += block(1, 0, vint(archive_flags))
+    for name, data in members.items():
+        nb = name.encode()
+        out += block(2, 0x2, vint(0) + vint(len(data)) + vint(0x20) + vint(0) + vint(1) + vint(len(nb)) + nb, data)
+    return out + block(5, 0, vint(0))
+
+
+def test_probe_rar_walker_stops_early_and_reads_rar5(tmp_path):
+    big = _noise(2 << 20)
+    # an image first: the walk stops there, whatever follows
+    data = _rar4_bytes({"imgs/OD.jpg": b"\xff\xd8" + b"x" * 50} | {f"raw/{i}.bin": big for i in range(8)})
+    res, _ = _probe(tmp_path, "d.rar", data)
+    assert res.outcome == "images" and res.n_members == 1 and res.n_requests <= 2 and res.method == "rar_headers"
+    # many small members, no image: the read block keeps growing over short hops
+    # (hops of 200 KB: past the 64 KB base block, so without the growth every
+    # header would cost a request of its own and the 50-request limit would stop the walk)
+    small = {f"tab/{i:04d}.csv": _noise(200_000, i) for i in range(100)}
+    data = _rar4_bytes(small)
+    res, _ = _probe(tmp_path, "t.rar", data)
+    assert res.outcome == "no_images" and res.n_members == 100 and res.n_requests <= 20, (res.n_requests, res.note)
+    # RAR 5
+    res, _ = _probe(tmp_path, "p5.rar", _rar5_bytes({"a/readme.txt": b"x" * 100, "a/scan.png": _png_bytes()}))
+    assert res.outcome == "images" and res.hit == "a/scan.png"
+    res, _ = _probe(tmp_path, "n5.rar", _rar5_bytes({"a/readme.txt": b"x" * 100, "b/t.csv": big}))
+    assert res.outcome == "no_images" and res.complete and res.n_members == 2 and res.bytes_used < len(big) // 2
+    res, _ = _probe(tmp_path, "v5.rar", _rar5_bytes({"b/t.csv": big}, archive_flags=0x1))
+    assert res.outcome == "unknown" and "multi-volume" in res.note
+    res, _ = _probe(tmp_path, "e5.rar", _rar5_bytes({"b/t.csv": big}, encrypted=True))
+    assert res.outcome == "unknown" and "encrypted" in res.note
+
+
+def test_unsampled_files_follow_a_sample_that_was_all_non_pixel(tmp_path):
+    """5084941: 2047 .npy spike-count arrays; the 60 sampled are signals, not
+    images, so the record has no image files rather than unreadable ones."""
+    pytest.importorskip("jsonschema")
+    rid = "790"
+    members = {}
+    for i in range(12):
+        buf = io.BytesIO()
+        np.save(buf, np.arange(3599, dtype=float))
+        members[f"spikes/cell_{i}.npy"] = buf.getvalue()
+    files = {"d.zip": _zip_bytes(members)}
+    s = _survey(tmp_path, _legacy(rid, files), files, rid, remote_cap=5)
+    row = s.process_record({"source_id": rid, "title": "T"})
+    assert row["status"] == "no_image_files", row.get("n_pixel_files_unread_by_reason")
+    assert row["n_pixel_files_unread_by_reason"] == {"not_sampled_like_sample": 7, "not_image_shaped": 5}
+    # one sampled file that is pixel-bearing but unreadable keeps the rest pixel-bearing
+    rid = "791"
+    members["spikes/cell_0.npy"] = bytes([0x93]) + b"NUMPY broken"
+    files = {"d.zip": _zip_bytes(members)}
+    (tmp_path / "b").mkdir()
+    s = _survey(tmp_path / "b", _legacy(rid, files), files, rid, remote_cap=12)
+    row = s.process_record({"source_id": rid, "title": "T"})
+    assert row["status"] == "images_unreadable" and row["n_pixel_files_unread_by_reason"]["decode_error"] == 1

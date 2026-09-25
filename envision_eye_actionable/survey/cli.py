@@ -2,10 +2,21 @@
 
 Subcommands:
 
-    envision-survey run          stream, classify, describe (resumable)
+    envision-survey run          fetch, classify, describe in one process (resumable)
+    envision-survey pipeline     fetch + process + monitor as three processes (the full pull)
+    envision-survey fetch        producer: fetch records into the spool (disk high-water mark)
+    envision-survey process      consumer: classify spooled records, write results, delete the spool dir
+    envision-survey monitor      disk, spool, queue, rates and ETA into <state>/status.json
+    envision-survey metadata     prefetch record JSON and DataCite JSON into the metadata cache
     envision-survey excel        build the workbook from survey_results.jsonl (one or several runs)
     envision-survey partition    id lists by expected mode (local, remote_zip, download, none)
     envision-survey export-onnx  export the timm checkpoint to ONNX (needs torch + timm)
+
+The full pull (see docs/survey.md):
+
+    envision-survey pipeline --model /path/model.onnx --scrape results/zenodo_full.json \
+        --metadata-cache-dir data/metadata/zenodo_full --out-dir results/survey_pull \
+        --spool-dir data/survey_spool --state-dir results/survey_pull_state
 
 Defaults follow the envision-discovery layout, so from the envision-discovery checkout root:
 
@@ -54,7 +65,17 @@ def _default_model() -> Path | None:
 
 
 def _add_run(sub):
-    p = sub.add_parser("run", help="classify records (resumable; one JSONL line per record)")
+    _add_common(sub.add_parser("run", help="classify records (resumable; one JSONL line per record)"))
+    for role, text in (("pipeline", "start fetch, process and monitor as three processes (restarts a crashed "
+                                    "fetch or process with backoff)"),
+                       ("fetch", "producer: fetch records into the spool dir"),
+                       ("process", "consumer: classify the spooled records and delete their spool dirs"),
+                       ("monitor", "write disk, spool, queue, rate and ETA status every --interval s"),
+                       ("metadata", "prefetch record and DataCite JSON of the scrape into the metadata cache")):
+        _add_common(sub.add_parser(role, help=text))
+
+
+def _add_common(p):
     p.add_argument("--model", type=Path, default=_default_model(),
                    help=f"ONNX model from export-onnx (required unless ${MODEL_ENV} is set)")
     p.add_argument("--scrape", type=Path, default=Path("./results/zenodo_all_results.json"),
@@ -77,8 +98,30 @@ def _add_run(sub):
     p.add_argument("--max-download-gb", type=float, default=15.0,
                    help="download non-zip files (rar/7z/tar/gz, top-level images) only when the record needs "
                         "less than this; larger records get status skipped_size (default 15)")
+    p.add_argument("--series-sample-k", type=int, default=3,
+                   help="top-level image files downloaded per homogeneous series of large files (same kind, "
+                        "extension and name with digits masked, each at least --series-min-mb); the rest are "
+                        "counted only (default 3; 0 downloads every file)")
+    p.add_argument("--series-min-mb", type=float, default=64.0,
+                   help="file size from which --series-sample-k applies, in MB (default 64)")
+    p.add_argument("--token-file", type=Path, default=None,
+                   help="file holding a Zenodo access token (one line; the ZENODO_TOKEN environment variable "
+                        "wins; default ~/.config/envision-survey/zenodo_token when it exists). Sent as a Bearer "
+                        "header to zenodo.org only, never logged, printed or written")
+    p.add_argument("--metadata-cache-dir", type=Path, default=None,
+                   help="where record metadata fetched from Zenodo is cached (legacy/ and datacite/ "
+                        "subdirs; default: <out-dir>/cache)")
     p.add_argument("--no-remote-zip", action="store_true",
                    help="download missing zips whole (subject to --max-download-gb) instead of sampling remotely")
+    p.add_argument("--no-archive-probe", action="store_true",
+                   help="download non-zip archives whole without first reading their listing by range "
+                        "requests (by default an archive whose whole listing holds no image, DICOM, volume or "
+                        "nested archive member is not downloaded)")
+    p.add_argument("--archive-probe-mb", type=float, default=64.0,
+                   help="bytes read at most per archive probe, in MB; compressed tars are listed from their "
+                        "first this many bytes (default 64)")
+    p.add_argument("--archive-probe-max-requests", type=int, default=50,
+                   help="range requests at most per archive probe (default 50)")
     p.add_argument("--remote-nested-max", type=int, default=20,
                    help="nested archives fetched per record when a remote zip holds zips (default 20)")
     p.add_argument("--remote-nested-gb", type=float, default=2.0,
@@ -113,9 +156,10 @@ def _add_run(sub):
     p.add_argument("--link-interval", type=float, default=1.0, help="seconds between link checks")
     p.add_argument("--zenodo-interval", type=float, default=0.5,
                    help="minimum seconds between two Zenodo requests (default 0.5)")
-    p.add_argument("--rpm", "--zenodo-rpm", dest="zenodo_rpm", type=int, default=110,
+    p.add_argument("--rpm", "--zenodo-rpm", dest="zenodo_rpm", type=int, default=120,
                    help="Zenodo requests per sliding minute for this process, all threads together (default "
-                        "110; Zenodo's guest limit is about 133 per IP). With --shared-state-dir the processes "
+                        "120; Zenodo allows 133 per minute per IP and User-Agent, token or not). With "
+                        "--shared-state-dir (or --state-dir) the processes "
                         "together are also held to --shared-rpm, so --rpm only sets a process's share, "
                         "e.g. --rpm 90 for remote_zip and --rpm 20 for download")
     p.add_argument("--shared-state-dir", type=Path, default=None,
@@ -124,9 +168,9 @@ def _add_run(sub):
                         "under --shared-rpm (zenodo_requests, under a file lock), and each subtracts the "
                         "downloads the others have in flight on the same disk before checking "
                         "--disk-floor-gb (disk_reserve.*). Without it all three are per process")
-    p.add_argument("--shared-rpm", type=int, default=110,
+    p.add_argument("--shared-rpm", type=int, default=120,
                    help="Zenodo requests per sliding minute of all the processes sharing --shared-state-dir "
-                        "together (default 110); ignored without --shared-state-dir")
+                        "(or --state-dir) together (default 120); ignored without either")
     p.add_argument("--offline", action="store_true", help="no Zenodo API calls (cache and metadata dir only)")
     p.add_argument("--keep-scratch", action="store_true", help="do not delete the scratch dir (debugging)")
     p.add_argument("--no-predictions", action="store_true", help="skip per-image predictions files")
@@ -137,7 +181,46 @@ def _add_run(sub):
     p.add_argument("--limit", type=int, default=None, help="process at most N pending records")
     p.add_argument("--retry-status", default="",
                    help="comma-separated statuses to reprocess (e.g. error,skipped_disk,skipped_size,crashed,"
-                        "remote_listing_failed,ok_partial_download)")
+                        "remote_listing_failed,ok_partial_download,images_unreadable)")
+    p.add_argument("--triage-cap", type=int, default=50,
+                   help="two-pass sampling: images classified first from each source (local and downloaded "
+                        "files; remote zip members and top-level image files fetched one by one). Only a "
+                        "record whose triage sample holds eye classes at --min-eye-fraction or more gets the "
+                        "deep sample (up to --max-images local, --remote-cap remote), reusing the triage "
+                        "images (default 50; 0: one pass)")
+    g = p.add_argument_group("pipeline (fetch, process, monitor, pipeline)")
+    g.add_argument("--spool-dir", type=Path, default=None,
+                   help="where the producer writes records for the consumer (new, empty or created by the "
+                        "survey; marker .envision_survey_spool). Never inside, around or equal to "
+                        "--downloads-dir or --out-dir")
+    g.add_argument("--state-dir", type=Path, default=None,
+                   help="status files, role locks, logs, events, request budget and 429 cooldown of the "
+                        "pipeline processes")
+    g.add_argument("--spool-max-gb", type=float, default=300.0,
+                   help="the producer starts no record while the spool holds more than this (default 300)")
+    g.add_argument("--fetch-workers", type=int, default=4,
+                   help="records the producer fetches at once, each with --download-workers streams "
+                        "(default 4)")
+    g.add_argument("--poll-s", type=float, default=10.0, help="polling interval of the roles (default 10)")
+    g.add_argument("--order", choices=("cost", "scrape"), default="cost",
+                   help="producer order: cost (records with little to download first, big archives last; "
+                        "default) or scrape order")
+    g.add_argument("--max-attempts", type=int, default=2,
+                   help="consumer starts of one record before it gets status crashed (default 2)")
+    g.add_argument("--consumer-grace-s", type=float, default=600.0,
+                   help="fetch: stop when the process role has been gone this long while the producer has to "
+                        "wait for it (full spool, or deep passes still possible) (default 600)")
+    g.add_argument("--max-role-restarts", type=int, default=20,
+                   help="pipeline: restarts of fetch or process (each) after a crash before the pipeline "
+                        "gives that role up (default 20)")
+    g.add_argument("--restart-backoff-s", type=float, default=10.0,
+                   help="pipeline: delay before the first restart of a role, doubled per restart, at most "
+                        "300 s (default 10)")
+    g.add_argument("--interval", type=float, default=60.0, help="monitor: seconds between snapshots (default 60)")
+    g.add_argument("--once", action="store_true", help="monitor: one snapshot, then exit")
+    g.add_argument("--exit-when-idle", action="store_true",
+                   help="monitor: exit when neither fetch nor process is running")
+    g.add_argument("--metadata-threads", type=int, default=2, help="metadata: worker threads (default 2)")
     p.add_argument("-v", "--verbose", action="store_true")
 
 
@@ -151,6 +234,9 @@ def _add_excel(sub):
     p.add_argument("--out", type=Path, default=Path("./results/survey/zenodo_modality_survey.xlsx"))
     p.add_argument("--model", type=Path, default=_default_model(),
                    help=f"ONNX model whose .json sidecar goes into the README (default: ${MODEL_ENV})")
+    p.add_argument("--cmds-json", choices=("auto", "embed", "paths"), default="auto",
+                   help="CMDS_JSON sheet: the documents as text (embed), their file paths and sizes (paths), "
+                        "or auto: embed up to 2000 records (default auto)")
 
 
 def _add_partition(sub):
@@ -196,7 +282,7 @@ def main(argv: list[str] | None = None) -> int:
             source = [d / "survey_results.jsonl" for d in args.results_dir]
         else:
             source = args.results
-        stats = build_workbook(source, args.out, load_model_meta(args.model))
+        stats = build_workbook(source, args.out, load_model_meta(args.model), cmds_json=args.cmds_json)
         print(json.dumps(stats, indent=2), flush=True)
         return 0
 
@@ -210,13 +296,22 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    from .zenodo import install_log_redaction
+    install_log_redaction()
     from .runner import SurveyConfig, run_survey
-    if args.model is None:
+    need_model = args.cmd in ("run", "process", "pipeline")
+    if need_model and args.model is None:
         parser.error(f"no model: pass --model /path/to/model.onnx or set {MODEL_ENV}")
-    if not args.model.is_file():
+    if need_model and not args.model.is_file():
         parser.error(f"--model {args.model} not found (export it with envision-survey export-onnx)")
     if args.downloads_dir is not None and not args.downloads_dir.is_dir():
         parser.error(f"--downloads-dir {args.downloads_dir} does not exist (wrong working directory?)")
+    if args.cmd in ("fetch", "process", "pipeline") and (args.spool_dir is None or args.state_dir is None):
+        parser.error(f"{args.cmd} needs --spool-dir and --state-dir")
+    if args.cmd == "monitor" and args.state_dir is None:
+        parser.error("monitor needs --state-dir")
+    if args.token_file is not None and not args.token_file.expanduser().is_file():
+        parser.error(f"--token-file {args.token_file} not found")
     downloads_dir = args.downloads_dir or Path("./data/downloads/zenodo")
     ids = list(args.ids)
     if args.ids_file:
@@ -230,11 +325,15 @@ def main(argv: list[str] | None = None) -> int:
             # An empty id list would mean "every record": refuse instead.
             parser.error("--ids-file: no record ids in " + ", ".join(str(f) for f in args.ids_file))
     cfg = SurveyConfig(
-        scrape_path=args.scrape, model_path=args.model, out_dir=args.out_dir,
+        scrape_path=args.scrape, model_path=args.model or Path("model-not-needed.onnx"), out_dir=args.out_dir,
         downloads_dir=downloads_dir,
         metadata_dir=args.metadata_dir if args.metadata_dir and args.metadata_dir.exists() else None,
         scratch_dir=args.scratch_dir, max_images=args.max_images, remote_cap=args.remote_cap,
         max_download_gb=args.max_download_gb, remote_zip=not args.no_remote_zip,
+        archive_probe=not args.no_archive_probe, archive_probe_mb=args.archive_probe_mb,
+        archive_probe_max_requests=args.archive_probe_max_requests,
+        series_sample_k=args.series_sample_k, series_min_mb=args.series_min_mb,
+        token_file=args.token_file, metadata_cache_dir=args.metadata_cache_dir,
         remote_nested_max=args.remote_nested_max,
         remote_nested_gb=args.remote_nested_gb, remote_record_budget_gb=args.remote_record_budget_gb,
         remote_max_member_mb=args.remote_max_member_mb, min_eye_fraction=args.min_eye_fraction,
@@ -248,10 +347,28 @@ def main(argv: list[str] | None = None) -> int:
         keep_scratch=args.keep_scratch, write_predictions=not args.no_predictions,
         offline=args.offline, ids=ids, limit=args.limit,
         retry_statuses=[s.strip() for s in args.retry_status.split(",") if s.strip()],
+        triage_cap=args.triage_cap, spool_dir=args.spool_dir, state_dir=args.state_dir,
+        spool_max_gb=args.spool_max_gb, fetch_workers=args.fetch_workers, poll_s=args.poll_s,
+        order=args.order, max_attempts=args.max_attempts, consumer_grace_s=args.consumer_grace_s,
+        max_role_restarts=args.max_role_restarts, restart_backoff_s=args.restart_backoff_s,
     )
-    stats = run_survey(cfg)
-    print(json.dumps(stats, indent=2), flush=True)
-    return 0
+    if args.cmd == "run":
+        stats = run_survey(cfg)
+        print(json.dumps(stats, indent=2), flush=True)
+        return 0
+    from . import pipeline as pl
+    if args.cmd == "metadata":
+        pl.prefetch_metadata(cfg, threads=args.metadata_threads)
+        return 0
+    if args.cmd == "fetch":
+        return pl.Producer(cfg).run()
+    if args.cmd == "process":
+        return pl.Processor(cfg).run()
+    if args.cmd == "monitor":
+        return pl.Monitor(cfg).run(args.interval, once=args.once, exit_when_idle=args.exit_when_idle)
+    raw = list(argv) if argv is not None else sys.argv[1:]
+    passthrough = raw[raw.index("pipeline") + 1:]
+    return pl.run_pipeline(cfg, passthrough, args.interval)
 
 
 if __name__ == "__main__":

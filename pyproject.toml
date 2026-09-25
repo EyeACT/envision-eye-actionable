@@ -73,6 +73,30 @@ survey = [
     # LZW / JPEG / deflate TIFF variants that Pillow cannot open go through
     # tifffile, which needs imagecodecs for most compressions.
     "imagecodecs>=2024.1",
+    # Format conversion: compressed DICOM transfer syntaxes (JPEG lossless,
+    # JPEG-LS, JPEG 2000), SVG rasterising (a wheel, no system cairo),
+    # HEIC, video frames (bundled ffmpeg), Deflate64 zips, zstd tars, vendor
+    # OCT (oct-converter imports cv2: the headless build needs no libGL) and
+    # microscopy containers.
+    "pylibjpeg>=2.0",
+    "pylibjpeg-libjpeg>=2.1",
+    "pylibjpeg-openjpeg>=2.3",
+    "resvg-py>=0.2",
+    "pillow-heif>=0.16",
+    "imageio-ffmpeg>=0.5",
+    "inflate64>=1.0",
+    # Deflate64 members of local and downloaded zips (archives.py; inflate64
+    # serves only the remote path)
+    "zipfile-deflate64>=0.2",
+    # one frame of a multi-frame DICOM without decoding them all
+    "pydicom>=3.0",
+    "zstandard>=0.22",
+    "opencv-python-headless>=4.8",
+    "pylibCZIrw>=4.0",
+    "readlif>=0.6",
+    "nd2>=0.10",
+    "mrcfile>=1.5",
+    "oiffile>=2024.1",
 ]
 
 dev = [

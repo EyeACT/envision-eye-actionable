@@ -227,6 +227,8 @@ class LinkChecker:
         self._last = 0.0
         self._host_not_before: dict[str, float] = {}
         self.cache: dict = {}
+        self._dirty = False
+        self._saved_at = time.monotonic()
         if cache_path.exists():
             try:
                 cached = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -262,11 +264,32 @@ class LinkChecker:
                                                   time.monotonic() + secs)
         return secs
 
+    def _account(self, r, first_counted: bool = True):
+        """Count every zenodo.org request of a response (redirect hops
+        included) into the shared Zenodo budget and pass each Zenodo answer
+        to ZenodoClient.observe, so a low X-RateLimit-Remaining pauses the
+        producer as well. The first request was already throttled when
+        ``first_counted``."""
+        if self.zenodo is None:
+            return
+        hops = list(getattr(r, "history", None) or []) + [r]
+        for i, h in enumerate(hops):
+            if not _is_zenodo_url(getattr(h, "url", "") or ""):
+                continue
+            if i > 0 or not first_counted:
+                self.zenodo.throttle()          # late, but it takes the slot the hop used
+            self.zenodo.observe(h)
+
     def _request(self, url: str):
+        zen = self.zenodo is not None and _is_zenodo_url(url)
         r = self.session.head(url, allow_redirects=True, timeout=self.timeout)
+        self._account(r, first_counted=zen)
         if r.status_code in (403, 405, 501) or r.status_code >= 500:
+            if zen:
+                self.zenodo.throttle()          # the fallback GET is a request of its own
             r = self.session.get(url, allow_redirects=True, timeout=self.timeout, stream=True)
             r.close()
+            self._account(r, first_counted=zen)
         return r
 
     def check(self, url: str) -> dict:
@@ -297,9 +320,18 @@ class LinkChecker:
                 break
         if _definitive(res):
             self.cache[url] = res
+            self._dirty = True
         return res
 
-    def save(self):
+    def save(self, min_interval_s: float = 0.0):
+        """Write the cache when it changed, and (``min_interval_s``) at most
+        that often: a 30,000-record run would otherwise rewrite a large
+        cache after every record."""
+        if not self._dirty or time.monotonic() - self._saved_at < min_interval_s:
+            return
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.cache_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.cache), encoding="utf-8")
         tmp.replace(self.cache_path)
+        self._dirty = False
+        self._saved_at = time.monotonic()

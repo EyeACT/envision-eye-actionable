@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -101,6 +102,9 @@ class DiskReservations:
         self.disk_path = Path(disk_path)
         self.bytes = 0
         self._lock_fp = None
+        # one writer at a time: the producer publishes from every fetch
+        # thread, and interleaved writes could publish a torn or stale file
+        self._write_lock = threading.RLock()
         if self.state_dir is None:
             return
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -118,17 +122,25 @@ class DiskReservations:
     def _write(self, nbytes: int):
         if self.state_dir is None:
             return
-        self.bytes = int(nbytes)
-        tmp = self._file.with_name(self._file.name + ".tmp")
-        try:
-            tmp.write_text(json.dumps({"pid": self.pid, "dev": self.dev, "bytes": self.bytes}), encoding="utf-8")
-            tmp.replace(self._file)
-        except OSError as e:
-            logger.warning("could not write the disk reservation %s: %s", self._file, e)
+        with self._write_lock:
+            self.bytes = int(nbytes)
+            tmp = self._file.with_name(f"{self._file.name}.{threading.get_ident()}.tmp")
+            try:
+                tmp.write_text(json.dumps({"pid": self.pid, "dev": self.dev, "bytes": self.bytes}),
+                               encoding="utf-8")
+                tmp.replace(self._file)
+            except OSError as e:
+                logger.warning("could not write the disk reservation %s: %s", self._file, e)
 
-    def reserve(self, nbytes: int):
-        """Publish ``nbytes`` as this process's in-flight reservation."""
-        self._write(nbytes)
+    def reserve(self, nbytes):
+        """Publish ``nbytes`` as this process's in-flight reservation.
+        ``nbytes`` may be a callable: it is then evaluated under the write
+        lock, so concurrent callers always publish the current total and an
+        older total never overwrites a newer one."""
+        if self.state_dir is None:
+            return
+        with self._write_lock:
+            self._write(nbytes() if callable(nbytes) else nbytes)
 
     def release(self):
         self._write(0)

@@ -5,9 +5,16 @@ Sheets:
     Records         one row per Zenodo record
     Record_Classes  one row per (record, present modality) with its DICOM mapping
     Weblinks        external links of records with no usable image files
+    Archive_Probes  one row per archive probed before a download
     DICOM_Mapping   reference: classifier class -> DICOM attributes and CMDS dirs
     Schema_Fields   which AI-READI / CMDS fields were filled from what
-    CMDS_JSON       the two CMDS JSON documents of every record, as text
+    CMDS_JSON       the two CMDS JSON documents of every record, as text (or,
+                    for large runs, their file paths)
+    Formats         source formats and conversion paths over all records
+
+The workbook is written in openpyxl's write-only mode from an index of the
+results JSONL (one row in memory at a time), so it scales to the full
+30,000-record pull.
 """
 
 from __future__ import annotations
@@ -33,6 +40,10 @@ RECORD_COLUMNS: list[tuple[str, str]] = [
     ("access_right", "Zenodo access_right"),
     ("size_mb", "Size MB (scrape)"),
     ("sampling_mode", "Sampling mode (local, remote_zip, download)"),
+    ("sampling_pass", "Sampling pass (single, triage, deep)"),
+    ("triage_eye_fraction", "Triage eye fraction (non-mask, thresholded)"),
+    ("n_triage_classified", "Images classified on the triage pass"),
+    ("deep_pass_reason", "Deep pass reason"),
     ("n_files_zenodo", "Files on Zenodo"),
     ("n_files_local", "Files used in place"),
     ("n_files_remote_zip", "Zips sampled remotely"),
@@ -40,11 +51,29 @@ RECORD_COLUMNS: list[tuple[str, str]] = [
     ("n_files_not_needed", "Files not fetched (non-image types)"),
     ("n_files_skipped_size", "Files not fetched (over --max-download-gb)"),
     ("download_failures", "Download failures"),
+    ("n_archives_probed", "Archives probed before download"),
+    ("n_archive_probe_images", "Probed archives with image members (downloaded)"),
+    ("n_archive_probe_no_images", "Probed archives without image members (not downloaded, listing catalogued)"),
+    ("n_archive_probe_unknown", "Probed archives undecided (downloaded as before)"),
+    ("archive_probe_bytes", "Archive probe bytes read"),
+    ("archive_probe_requests", "Archive probe requests"),
+    ("archive_probe_bytes_avoided", "Download bytes avoided by the archive probe"),
+    ("n_series_files_not_fetched", "Large top-level files of a homogeneous series not fetched (a seeded few were)"),
+    ("split_join_detail", "Split archive sets joined"),
     ("n_archives_listed", "Archives listed"),
     ("n_images_listed", "Images seen in listings"),
     ("n_image_files", "Image files (total, incl. archive members; estimate when sampled remotely; excludes unsampleable members)"),
+    ("member_ext_counts", "Archive members by extension (top 25; local, remote and probed archives)"),
+    ("formats_classified", "Source formats of the classified images"),
+    ("conversion_counts", "Conversion paths of the classified images (digits masked)"),
+    ("formats_unread", "Source formats of the files that gave no image"),
+    ("n_pixel_files_unread_by_reason", "Pixel-bearing files that gave no image, by reason"),
+    ("n_blank", "Blank (constant) frames, not classified"),
+    ("n_mask_like_veto", "Mask-like images kept as NEG or UNCERTAIN (model argmax NEG: graphics)"),
+    ("mask_exempt_class", "Eye class exempting the record from mask_dominated"),
     ("n_remote_sampled", "Remote members sampled"),
     ("n_remote_fetched", "Remote members fetched"),
+    ("n_remote_reused", "Remote members of the deep sample reused from the triage pass"),
     ("remote_fetch_failures", "Remote fetch failures"),
     ("n_remote_nested_fetched", "Remote nested archives fetched"),
     ("remote_nested_bytes", "Remote nested archive bytes"),
@@ -85,8 +114,8 @@ RECORD_COLUMNS: list[tuple[str, str]] = [
     ("ir_non_spectralis_candidate", "IR non-Spectralis candidate"),
     ("ir_Manufacturer", "Maker of the IR-classified images"),
     ("ir_Manufacturer_source", "IR maker source (dicom_header, exif)"),
-    ("setfit_label", "SetFit metadata label (info only)"),
-    ("setfit_prob_eye_imaging", "SetFit p(eye) (info only)"),
+    ("setfit_label", "Discovery SetFit metadata label (informational only; NOT used to select records)"),
+    ("setfit_prob_eye_imaging", "Discovery SetFit p(eye imaging) (informational only; NOT used to select records)"),
     ("dicom_mapping_status", "DICOM mapping status"),
     ("dicom_header_attributes_used", "Attributes read from DICOM headers"),
     ("dicom_Modality", "Modality (0008,0060)"),
@@ -178,6 +207,7 @@ RECORD_COLUMNS: list[tuple[str, str]] = [
     ("walk_error_detail", "Archive error detail"),
     ("download_failure_detail", "Download failure detail"),
     ("remote_listing_detail", "Remote zip listings"),
+    ("archive_probe_detail", "Archive probe detail (per archive: outcome, method, members, images, bytes, requests)"),
     ("remote_fetch_failure_detail", "Remote fetch failure detail"),
     ("remote_requests", "Remote requests"),
     ("size_note", "Size note"),
@@ -185,7 +215,10 @@ RECORD_COLUMNS: list[tuple[str, str]] = [
     ("error", "Error"),
     ("results_dir", "Results dir (when several runs were merged)"),
     ("keywords", "Keywords"),
-    ("elapsed_s", "Seconds"),
+    ("elapsed_s", "Seconds (classification)"),
+    ("fetch_s", "Seconds (fetch, pipeline)"),
+    ("spool_bytes", "Bytes fetched into the spool (pipeline)"),
+    ("deep_fetch_error", "Deep pass fetch error"),
     ("finished_at", "Finished at (UTC)"),
 ]
 
@@ -195,6 +228,16 @@ WEBLINK_COLUMNS = [
     ("dataset_likely", "Dataset likely"), ("http_status", "HTTP status"), ("final_url", "Redirected to"),
     ("content_type", "Content-Type"), ("content_length", "Content-Length"), ("error", "Check error"),
     ("origin", "Found in"), ("scraper_type", "Discovery link type"), ("url_raw", "Raw URL (before cleaning)"),
+]
+
+ARCHIVE_PROBE_COLUMNS = [
+    ("record_id", "Zenodo record id"), ("record_status", "Record status"), ("archive", "Archive"),
+    ("size", "Size (bytes)"), ("format", "Format"),
+    ("outcome", "Outcome (images: downloaded; no_images: not downloaded; unknown: downloaded as before)"),
+    ("method", "Probe method"), ("complete", "Whole listing read"), ("n_members", "Members listed"),
+    ("n_images", "Image, DICOM or volume members"), ("n_nested", "Nested archives"),
+    ("n_noext", "Extensionless members (possible DICOM)"), ("bytes", "Probe bytes"),
+    ("requests", "Probe requests"), ("hit", "First image-bearing member"), ("note", "Note"),
 ]
 
 SCHEMA_FIELDS = [
@@ -312,7 +355,7 @@ def _rel_cmds_dir(cmds_dir: str, results_path: Path) -> str:
         return "/".join(parts[parts.index("cmds"):]) if "cmds" in parts else p.as_posix()
 
 
-UNFINISHED_STATUSES = ("started", "crashed")   # in progress, or died inside the record
+UNFINISHED_STATUSES = ("started", "crashed", "awaiting_deep")   # in progress, died inside, or waiting for its deep pass
 
 
 def results_dir_labels(results_paths: list[Path]) -> dict[str, str]:
@@ -360,74 +403,355 @@ def merge_results(results_paths: list[Path]) -> dict[str, dict]:
     return merged
 
 
-def build_workbook(results_path: Path | list[Path], out_path: Path, model_meta: dict | None = None) -> dict:
+def merge_index(results_paths: list[Path]) -> dict[str, tuple[int, int, str | None]]:
+    """The merge of merge_results as an index, without keeping any row in
+    memory: {record id: (file index, byte offset of the winning line,
+    status)}. Same rules: last line per id within a file, the last file
+    across files, an unfinished row never replaces a finished one."""
+    merged: dict[str, tuple[int, int, str | None]] = {}
+    for fi, path in enumerate(results_paths):
+        last: dict[str, tuple[int, str | None]] = {}
+        if not Path(path).exists():
+            continue
+        with open(path, "rb") as fp:
+            while True:
+                off = fp.tell()
+                line = fp.readline()
+                if not line:
+                    break
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                rid = row.get("record_id")
+                if rid:
+                    last[str(rid)] = (off, row.get("status"))
+        for rid, (off, st) in last.items():
+            old = merged.get(rid)
+            if old is not None and st in UNFINISHED_STATUSES and old[2] not in UNFINISHED_STATUSES:
+                continue
+            merged.pop(rid, None)
+            merged[rid] = (fi, off, st)
+    return merged
+
+
+def _iter_rows(paths: list[Path], index: dict[str, tuple[int, int, str | None]], order: list[str]):
+    """Rows of ``index`` in ``order``, read one at a time by offset, with
+    _results_path (and results_dir when several files) and the backfill."""
+    labels = results_dir_labels(paths) if len(paths) > 1 else {}
+    fps = {}
+    try:
+        for rid in order:
+            fi, off, _ = index[rid]
+            fp = fps.get(fi)
+            if fp is None:
+                fp = fps[fi] = open(paths[fi], "rb")
+            fp.seek(off)
+            row = json.loads(fp.readline())
+            own = Path(paths[fi])
+            row["_results_path"] = str(own)
+            if labels:
+                row["results_dir"] = labels[str(own)]
+            backfill(row)
+            if row.get("cmds_dir"):
+                row["_cmds_folder"] = str(_cmds_folder(row["cmds_dir"], own))
+                row["cmds_dir"] = _rel_cmds_dir(row["cmds_dir"], own)
+                row["cmds_folder"] = _cmds_folder(row["cmds_dir"], own.resolve()).as_posix()
+            yield row
+    finally:
+        for fp in fps.values():
+            fp.close()
+
+
+EMBED_CMDS_MAX_ROWS = 2000     # CMDS_JSON embeds the documents up to this many records (auto)
+
+
+def build_workbook(results_path: Path | list[Path], out_path: Path, model_meta: dict | None = None,
+                   cmds_json: str = "auto") -> dict:
     """Write the workbook from one results JSONL or several (merged by
-    record id, the last one wins; see merge_results). Returns simple stats."""
+    record id, the last one wins; see merge_results). Streamed: rows are
+    read one at a time by offset and written with openpyxl's write-only
+    mode, so 30,000 records need little memory. ``cmds_json``: embed (the
+    two CMDS documents as text), paths (their file paths and validity), or
+    auto (embed up to EMBED_CMDS_MAX_ROWS records). Returns simple stats."""
     from openpyxl import Workbook
+    from openpyxl.cell import WriteOnlyCell
     from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
 
     paths = [Path(p) for p in results_path] if isinstance(results_path, (list, tuple)) else [Path(results_path)]
-    rows = sorted(merge_results(paths).values(), key=lambda r: int(r["record_id"])
-                  if str(r["record_id"]).isdigit() else 0)
-    for r in rows:
-        backfill(r)
-        if r.get("cmds_dir"):
-            own = Path(r["_results_path"])
-            r["_cmds_folder"] = str(_cmds_folder(r["cmds_dir"], own))
-            r["cmds_dir"] = _rel_cmds_dir(r["cmds_dir"], own)
-            # Full folder (the results dir resolved, plus cmds/<id>), so rows
-            # merged from several results dirs are unambiguous.
-            r["cmds_folder"] = _cmds_folder(r["cmds_dir"], own.resolve()).as_posix()
-    wb = Workbook()
+    index = merge_index(paths)
+    order = sorted(index, key=lambda r: (0, int(r)) if str(r).isdigit() else (1, 0))
+    embed = cmds_json == "embed" or (cmds_json == "auto" and len(order) <= EMBED_CMDS_MAX_ROWS)
+
+    # ---- pass 1: statistics, column widths (first 300 rows), format totals
+    stats = {"n": len(order), "status": Counter(), "passes": Counter(), "n_classified": 0, "n_eye": 0,
+             "n_mask_dominated": 0, "first": {}, "n_cmds": 0, "n_dirs": 0}
+    prov_counts: dict[tuple[str, str], Counter] = defaultdict(Counter)
+    fmt = {k: (Counter(), Counter()) for k in ("formats_classified", "formats_unread", "conversion_counts")}
+    counts = {"weblinks": 0, "record_classes": 0, "archive_probes": 0}
+    widths: dict[str, dict[str, int]] = defaultdict(dict)
+    for i, r in enumerate(_iter_rows(paths, index, order)):
+        if i == 0:
+            stats["first"] = {k: v for k, v in r.items() if not isinstance(v, (list, dict))}
+        stats["status"][r.get("status")] += 1
+        stats["passes"][r.get("sampling_pass") or "(none)"] += 1
+        stats["n_classified"] += (r.get("n_classified") or 0) > 0
+        stats["n_eye"] += bool(r.get("present_eye_classes"))
+        stats["n_mask_dominated"] += bool(r.get("mask_dominated"))
+        stats["n_cmds"] += bool(r.get("cmds_dir"))
+        stats["n_dirs"] += bool(r.get("cmds_directories"))
+        for fld, src in (r.get("cmds_provenance") or {}).items():
+            prov_counts[("dataset_description", fld)][src] += 1
+        for key, (n_img, n_rec) in fmt.items():
+            for f, n in (r.get(key) or {}).items():
+                n_img[f] += n or 0
+                n_rec[f] += 1
+        counts["weblinks"] += len(r.get("weblinks") or [])
+        counts["record_classes"] += len(r.get("_class_detail") or {})
+        counts["archive_probes"] += len(r.get("archive_probes") or [])
+        if i < 300:
+            for key, _ in RECORD_COLUMNS:
+                v = r.get(key)
+                if v is not None:
+                    widths["Records"][key] = max(widths["Records"].get(key, 0), len(str(_fmt(v) or "")))
+
+    wb = Workbook(write_only=True)
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill("solid", fgColor="305496")
+    link_font = Font(color="0563C1", underline="single")
 
     def clean(v):
         v = _fmt(v)
         return ILLEGAL_CHARACTERS_RE.sub("", v) if isinstance(v, str) else v
 
-    def table(ws, columns: list[tuple[str, str]], data: list[dict], freeze="B2", link_cols=("url",)):
-        ws.append([label for _, label in columns])
-        for c in ws[1]:
-            c.font, c.fill = header_font, header_fill
-            c.alignment = Alignment(wrap_text=True, vertical="top")
-        for d in data:
-            ws.append([clean(d.get(key)) for key, _ in columns])
-        for idx, (key, label) in enumerate(columns, 1):
-            letter = get_column_letter(idx)
-            sample = [len(str(d.get(key) or "")) for d in data[:300]]
-            width = max([min(len(label), 28)] + sample)
-            ws.column_dimensions[letter].width = max(8, min(width + 2, 60))
-            if key in link_cols:
-                for cell in ws[letter][1:]:
-                    if isinstance(cell.value, str) and cell.value.startswith("http"):
-                        cell.hyperlink = cell.value
-                        cell.font = Font(color="0563C1", underline="single")
-        ws.freeze_panes = freeze
-        if data:
-            ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{len(data) + 1}"
-        ws.row_dimensions[1].height = 45
+    class Table:
+        def __init__(self, title, columns, n_rows, freeze="B2", link_cols=("url",), width_hint=None):
+            self.ws = wb.create_sheet(title)
+            self.columns, self.link_cols = columns, set(link_cols)
+            for idx, (key, label) in enumerate(columns, 1):
+                w = max(min(len(label), 28), (width_hint or {}).get(key, 0))
+                self.ws.column_dimensions[get_column_letter(idx)].width = max(8, min(w + 2, 60))
+            self.ws.freeze_panes = freeze
+            if n_rows:
+                self.ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{n_rows + 1}"
+            head = []
+            for _, label in columns:
+                c = WriteOnlyCell(self.ws, value=label)
+                c.font, c.fill = header_font, header_fill
+                c.alignment = Alignment(wrap_text=True, vertical="top")
+                head.append(c)
+            self.ws.row_dimensions[1].height = 45
+            self.ws.append(head)
+
+        def add(self, d: dict):
+            out = []
+            for key, _ in self.columns:
+                v = clean(d.get(key))
+                if key in self.link_cols and isinstance(v, str) and v.startswith("http"):
+                    c = WriteOnlyCell(self.ws, value=v)
+                    if len(v) <= 2000:                        # Excel's hyperlink length limit
+                        c.hyperlink = v
+                        c.font = link_font
+                    out.append(c)
+                else:
+                    out.append(v)
+            self.ws.append(out)
 
     # ---- README
-    ws = wb.active
-    ws.title = "README"
-    status = Counter(r.get("status") for r in rows)
-    first = rows[0] if rows else {}
+    ws = wb.create_sheet("README")
+    ws.column_dimensions["A"].width = 32
+    ws.column_dimensions["B"].width = 120
+    for i, (k, v) in enumerate(_readme_rows(stats, paths, model_meta)):
+        a = WriteOnlyCell(ws, value=clean(k))
+        a.font = Font(bold=True, size=14) if i == 0 else Font(bold=True)
+        b = WriteOnlyCell(ws, value=clean(v))
+        b.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.append([a, b])
+
+    # ---- per-record sheets, written in one pass
+    records = Table("Records", RECORD_COLUMNS, stats["n"], width_hint=widths["Records"])
+    rc_cols = [("record_id", "Zenodo record id"), ("title", "Title"), ("class", "Class"), ("label", "Label"),
+               ("n_sampled", "Sampled images"), ("frac", "Fraction of sample"), ("est_files", "Estimated files"),
+               ("mean_conf", "Mean confidence"), ("cmds_dir", "CMDS directory"),
+               ("dicom_Modality", "Modality"), ("dicom_SOPClassUID", "SOP Class UID"),
+               ("dicom_SOPClassName", "SOP Class name"), ("dicom_ImageType", "Image Type"),
+               ("dicom_BodyPartExamined", "Body Part Examined"), ("dicom_AnatomicRegion", "Anatomic Region"),
+               ("dicom_AcquisitionDeviceType", "Acquisition Device Type"),
+               ("dicom_LightPathFilter", "Light Path Filter"), ("dicom_ChannelDescription", "Channel Description"),
+               ("dicom_SamplesPerPixelUsed", "Samples Per Pixel Used"),
+               ("dicom_OphthalmicImageType", "Ophthalmic Image Type"),
+               ("dicom_IlluminationType", "Illumination Type")]
+    rclasses = Table("Record_Classes", rc_cols, counts["record_classes"], freeze="D2")
+    weblinks = Table("Weblinks", WEBLINK_COLUMNS, counts["weblinks"], freeze="D2", link_cols=("url", "final_url"))
+    probes = Table("Archive_Probes", ARCHIVE_PROBE_COLUMNS, counts["archive_probes"], freeze="C2")
+    if embed:
+        cj_cols = [("record_id", "Zenodo record id"), ("cmds_folder", "CMDS JSON folder (results dir + cmds/<id>)"),
+                   ("dd_valid", "dataset_description valid"), ("dsd_valid", "dataset_structure_description valid"),
+                   ("dataset_description", "dataset_description.json"),
+                   ("dataset_structure_description", "dataset_structure_description.json")]
+    else:
+        cj_cols = [("record_id", "Zenodo record id"), ("cmds_folder", "CMDS JSON folder (results dir + cmds/<id>)"),
+                   ("dd_valid", "dataset_description valid"), ("dsd_valid", "dataset_structure_description valid"),
+                   ("dd_file", "dataset_description.json file"),
+                   ("dsd_file", "dataset_structure_description.json file"),
+                   ("dd_bytes", "dataset_description.json bytes"),
+                   ("dsd_bytes", "dataset_structure_description.json bytes")]
+    cmds_sheet = None                   # created after the reference sheets (sheet order kept below)
+    cj_pending: list[dict] = []
+    for r in _iter_rows(paths, index, order):
+        records.add(r)
+        detail = r.get("_class_detail") or {}
+        per_class = r.get("dicom_per_class") or {}
+        for cls, info in detail.items():
+            d = per_class.get(cls) or {}
+            dtype, mdir, _ = CLASS_DIRS.get(cls, ("", "", ""))
+            rclasses.add({
+                "record_id": r["record_id"], "title": r.get("title"), "class": cls,
+                "label": CLASS_LABELS.get(cls), "n_sampled": info.get("count"),
+                "frac": r.get(f"frac_{cls}"), "est_files": info.get("est_files"),
+                "mean_conf": round(info.get("mean_conf") or 0, 4),
+                "cmds_dir": f"{dtype}/{mdir}", **{f"dicom_{k}": v for k, v in d.items()},
+            })
+        for link in r.get("weblinks") or []:
+            weblinks.add({"record_id": r["record_id"], "record_title": r.get("title"),
+                          "record_status": r.get("status"), **link})
+        for a in r.get("archive_probes") or []:
+            probes.add({"record_id": r["record_id"], "record_status": r.get("status"),
+                        **{("archive" if k == "key" else k): v for k, v in a.items()}})
+        if r.get("cmds_dir"):
+            cj_pending.append({"record_id": r["record_id"], "cmds_folder": r["cmds_folder"],
+                               "_cmds_folder": r["_cmds_folder"], "dd_valid": r.get("dd_valid"),
+                               "dsd_valid": r.get("dsd_valid")})
+
+    # ---- DICOM_Mapping (reference)
+    m = mapping()
+    dm_cols = [("class", "Class"), ("label", "Label"), ("Modality", "Modality (0008,0060)"),
+               ("Modality_meaning", "Modality meaning"), ("SOPClassUID", "SOP Class UID"),
+               ("SOPClassName", "SOP Class name"), ("SOPClassUID_16bit", "Alternative SOP Class UID"),
+               ("ImageType", "Image Type"), ("BodyPart", "Body Part Examined"), ("Anatomic", "Anatomic Region"),
+               ("Device", "Acquisition Device Type"), ("Filter", "Light Path Filter"),
+               ("Channel", "Channel Description"), ("Photometric", "Expected Photometric Interpretation"),
+               ("cmds_dir", "CMDS directory"), ("notes", "Notes")]
+    dmt = Table("DICOM_Mapping", dm_cols, len(CLASSES))
+
+    def code(c):
+        if not c:
+            return ""
+        if isinstance(c, list):
+            return "; ".join(code(x) for x in c)
+        return f"{c.get('CodingSchemeDesignator')} {c.get('CodeValue')} {c.get('CodeMeaning')}"
+
+    for cls in CLASSES:
+        sp = m["classes"][cls]
+        dtype, mdir, _ = CLASS_DIRS.get(cls, ("(none)", "", ""))
+        dmt.add({
+            "class": cls, "label": sp.get("label"), "Modality": sp.get("Modality_0008_0060"),
+            "Modality_meaning": sp.get("Modality_meaning"), "SOPClassUID": sp.get("SOPClassUID_0008_0016"),
+            "SOPClassName": sp.get("SOPClassName"),
+            "SOPClassUID_16bit": "; ".join(v for v in (
+                sp.get("SOPClassUID_if_16bit"), sp.get("SOPClassUID_alternative_if_native_projection")) if v),
+            "ImageType": "\\".join(sp.get("ImageType_0008_0008") or []),
+            "BodyPart": sp.get("BodyPartExamined_0018_0015") or "",
+            "Anatomic": code(sp.get("AnatomicRegionSequence_0008_2218")),
+            "Device": code(sp.get("AcquisitionDeviceTypeCodeSequence_0022_0015")),
+            "Filter": code(sp.get("LightPathFilterTypeStackCodeSequence_0022_0017")),
+            "Channel": code(sp.get("ChannelDescriptionCodeSequence_0022_001A")),
+            "Photometric": sp.get("expected_PhotometricInterpretation") or "",
+            "cmds_dir": f"{dtype}/{mdir}" if mdir else "(not a CMDS directory)",
+            "notes": sp.get("notes"),
+        })
+
+    # ---- Schema_Fields
+    sf_cols = [("schema", "Schema"), ("field", "Field"), ("required", "Required"), ("rule", "Mapping rule"),
+               ("records", "Records filled"), ("sources", "Sources used (records)")]
+    sft = Table("Schema_Fields", sf_cols, len(SCHEMA_FIELDS), freeze="C2")
+    for schema, fld, req, rule in SCHEMA_FIELDS:
+        c = prov_counts.get((schema, fld), Counter())
+        if schema == "dataset_description":
+            filled = sum(c.values())
+        elif fld == "directoryList":
+            filled = stats["n_dirs"]       # records without an eye modality get an empty directoryList
+        else:
+            filled = stats["n_cmds"]
+        sft.add({"schema": schema, "field": fld, "required": "yes" if req else "no", "rule": rule,
+                 "records": filled, "sources": "; ".join(f"{k} ({v})" for k, v in c.most_common())})
+
+    # ---- CMDS_JSON: the two documents per record, as text or as file paths
+    cmds_sheet = Table("CMDS_JSON", cj_cols, len(cj_pending), freeze="B2")
+    for d in cj_pending:
+        folder = Path(d.pop("_cmds_folder"))
+        if embed:
+            for name in ("dataset_description", "dataset_structure_description"):
+                try:
+                    txt = (folder / f"{name}.json").read_text(encoding="utf-8")
+                except OSError:
+                    txt = ""
+                if len(txt) > _CELL_MAX:
+                    txt = txt[:_CELL_MAX] + "\n... [truncated; see the JSON file]"
+                d[name] = txt
+        else:
+            for short, name in (("dd", "dataset_description"), ("dsd", "dataset_structure_description")):
+                f = folder / f"{name}.json"
+                d[f"{short}_file"] = f"{d['cmds_folder']}/{name}.json"
+                try:
+                    d[f"{short}_bytes"] = f.stat().st_size
+                except OSError:
+                    d[f"{short}_bytes"] = None
+        cmds_sheet.add(d)
+
+    # ---- Formats: source formats and conversion paths over all records
+    fo_cols = [("kind", "Table"), ("name", "Format or conversion path"), ("images", "Images (files)"),
+               ("records", "Records")]
+    fo_rows = []
+    for key, label in (("formats_classified", "classified images by source format"),
+                       ("formats_unread", "files that gave no image, by source format"),
+                       ("conversion_counts", "classified images by conversion path")):
+        n_img, n_rec = fmt[key]
+        fo_rows += [{"kind": label, "name": f, "images": n, "records": n_rec[f]} for f, n in n_img.most_common()]
+    fot = Table("Formats", fo_cols, len(fo_rows), freeze="C2")
+    for d in fo_rows:
+        fot.add(d)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_name(out_path.name + ".tmp.xlsx")
+    wb.save(tmp)
+    tmp.replace(out_path)
+    return {"records": stats["n"], "weblinks": counts["weblinks"], "record_classes": counts["record_classes"],
+            "archive_probes": counts["archive_probes"], "cmds_json": "embedded" if embed else "paths",
+            "status": dict(stats["status"]), "path": str(out_path)}
+
+
+def _readme_rows(stats: dict, paths: list[Path], model_meta: dict | None) -> list[tuple]:
+    status = stats["status"]
+    first = stats["first"]
     model_meta = model_meta or {}
     readme = [
         ("EyeACT Zenodo modality survey", ""),
         ("Generated (UTC)", datetime.now(timezone.utc).isoformat(timespec="seconds")),
-        ("Records", len(rows)),
+        ("Records", stats["n"]),
         ("Results merged from", "; ".join(dict.fromkeys(results_dir_labels(paths).values())) if len(paths) > 1 else "one run"),
         ("Records by status", "; ".join(f"{k}: {v}" for k, v in status.most_common())),
-        ("Records with classified images", sum(1 for r in rows if (r.get("n_classified") or 0) > 0)),
-        ("Records with an eye modality", sum(1 for r in rows if r.get("present_eye_classes"))),
-        ("Records mask-dominated (eye classes review only)", sum(1 for r in rows if r.get("mask_dominated"))),
+        ("Records with classified images", stats["n_classified"]),
+        ("Records with an eye modality", stats["n_eye"]),
+        ("Records mask-dominated (eye classes review only)", stats["n_mask_dominated"]),
         ("", ""),
-        ("Scope", "Every record of the unfiltered envision-discovery Zenodo scrape. The SetFit metadata "
-                  "classifier was NOT used to select records; its label is kept as an informational column."),
+        ("Scope", "Every record of the unfiltered envision-discovery Zenodo scrape (the records its eye-imaging "
+                  "keyword queries found). The SetFit metadata classifier was NOT used to select, skip or order "
+                  "records; its label and p(eye) are kept as informational columns only."),
+        ("Records by sampling pass", "; ".join(f"{k}: {v}" for k, v in stats["passes"].most_common()) or "none"),
+        ("Two-pass sampling", "Triage: at most --triage-cap (default 50) images from each source (local and "
+                              "downloaded files; remote zip members and top-level image files fetched one by "
+                              "one) are classified first. Only a record whose triage sample has eye classes "
+                              "(thresholded, non-mask) at --min-eye-fraction or more gets the deep sample: the "
+                              "rest of the same seeded order, up to --max-images for local and downloaded files "
+                              "and --remote-cap for remote members, the triage images kept. 'Sampling pass' "
+                              "says which: single (one pass), triage or deep; 'Triage eye fraction' and 'Deep "
+                              "pass reason' give the decision. Archives that cannot be read remotely are "
+                              "downloaded whole once, on the triage pass."),
         ("Method", "Files already downloaded were read in place (sampling_mode local). A zip that was not on "
                    "disk was not downloaded: its members were listed through Zenodo's container API (or, when "
                    "that listing is capped at about 1000 items, by HTTP range reads of the zip's central "
@@ -438,8 +762,15 @@ def build_workbook(results_path: Path | list[Path], out_path: Path, model_meta: 
                    "scratch dir and deleted after the record (download), up to --max-download-gb per record, "
                    "smallest files first; files that did not fit are listed, and a record with nothing readable "
                    "gets status skipped_size (file list and weblinks still catalogued). "
-                   "Archives were listed, not unpacked: only the sampled members were read. Each sampled image was decoded (first frame of multi-page TIFF, middle frame "
-                   "of multi-frame DICOM, middle slice of NIfTI/NRRD/MHA), content-cropped and squashed to a "
+                   "Before a non-zip archive was downloaded, its listing was read with a few HTTP range "
+                   "requests (archive probe: tar headers, the first 64 MB of a compressed tar, the 7z end "
+                   "header, rar block headers, the inner name of x.tif.gz): an archive whose whole listing "
+                   "held no image, DICOM, volume or nested archive member was not downloaded (its listing is "
+                   "catalogued; a record with nothing else to read gets status no_images_in_archives), and "
+                   "an undecided probe kept the download (see the Archive_Probes sheet). "
+                   "Archives were listed, not unpacked: only the sampled members were read. Every "
+                   "pixel-bearing format was converted to an RGB frame (see 'Format conversion'), "
+                   "content-cropped and squashed to a "
                    "256 x 256 square (aspect ratio not kept) exactly as the training images were stored, resized "
                    "to 224 x 224 (the training Resize(224) + CenterCrop(224) on a square) and classified by the "
                    "ONNX export of the model."),
@@ -460,17 +791,44 @@ def build_workbook(results_path: Path | list[Path], out_path: Path, model_meta: 
         ("Confidence threshold", f"Top-1 probability below {first.get('threshold')} is counted as UNCERTAIN. "
                                  "The 'argmax' columns count every classified image by its top class, ignoring "
                                  "the threshold."),
+        ("Format conversion", "TIFF (BigTIFF, tiled, pyramids, OME, ImageJ, LSM, SVS; 8 to 32 bit and float) "
+                              "through tifffile: a pyramid gives its smallest level with a long side of at least "
+                              "1024 px, a stack of same-shape pages its middle plane (first channel), and an image "
+                              "over the pixel budget a strided decode, one strip or tile at a time (never skipped "
+                              "for size). JPEG at a reduced DCT scale, JPEG 2000 at a reduced resolution level, "
+                              "PNG, BMP, GIF, WebP, PSD, HEIC through Pillow. SVG: the largest embedded raster "
+                              "image, else rendered 512 px wide with every external reference removed. DICOM "
+                              "(JPEG lossless, JPEG-LS, JPEG 2000 and RLE transfer syntaxes decoded): middle "
+                              "frame. NIfTI, NRRD, MHA and header pairs (MHD + RAW, Analyze HDR + IMG): middle "
+                              "slice along the shortest axis. NumPy, HDF5, MAT v5 and v7.3 arrays: an image-shaped "
+                              "dataset (both sides at least 64 px, aspect at most 32; names such as image, oct, "
+                              "bscan, fundus preferred), middle slice. Microscopy (CZI, LIF, ND2, OIB, MRC): middle "
+                              "Z plane, first channel. Vendor OCT (Heidelberg E2E and VOL, Topcon FDS and FDA, "
+                              "Thorlabs and Bioptigen OCT): middle B-scan, plus the fundus or SLO image as its own "
+                              "prediction (path ending #fundus); Heidelberg SDB is catalogued only. Video: frames "
+                              "at 25, 50 and 75% of the duration, probabilities averaged into one prediction. "
+                              "Integer data deeper than 8 bits and floats are windowed between the 0.5 and 99.5 "
+                              "percentiles (few-level data such as label maps keeps min-max), transparency is "
+                              "composited over white, and a constant (blank) frame is not classified (n blank). "
+                              "The source format and conversion path of every image are in the predictions file "
+                              "and summarised per record. Records with no classified image are no_image_files "
+                              "(nothing pixel-bearing listed) or images_unreadable (pixel files listed, none "
+                              "decoded; reasons per record). Large top-level images of one homogeneous series "
+                              "(same name pattern, 64 MB and more each) are sampled, 3 per series."),
         ("Masks", "Images the pixel check flags as segmentation masks or label maps (in a 128 x 128 "
                   "nearest-neighbour sample: gray with at most 4 levels, or color with at most 8 colors; or, "
                   "for anti-aliased masks and label maps, the 4 most common gray levels or the 8 most common "
                   "colors cover at least 95% of the sample and the values after the most common one cover at "
-                  "least 60% of the pixels outside it) get "
+                  "least 60% of the pixels outside it; single-channel data deeper than 8 bits is tested on its "
+                  "native values) AND whose model argmax is an eye class get "
                   "the label MASK instead of a "
                   "modality, in the thresholded and the argmax columns alike (n MASK, frac MASK, argmax n MASK, "
                   "argmax frac MASK). Like UNCERTAIN, MASK is not a modality: dominant classes, mean confidence, "
                   "mean probabilities, the eye image fraction and eye class presence are taken over the non-mask "
                   "images, and the dominant class is MASK only when every classified image is a mask. The model's "
-                  "own prediction for a mask stays in the per-image predictions file (top, model_label)."),
+                  "own prediction for a mask stays in the per-image predictions file (top, model_label). A "
+                  "flagged image whose argmax is NEG keeps its model label (flat-colour graphics: plots, word "
+                  "clouds, logos; mask_like_veto in the predictions file)."),
         ("Eye images", f"A record has eye images (status ok) only when the eye classes (CFP, IR, PSC, FAF, OCT, "
                        f"OCTA; thresholded labels) make up at least --min-eye-fraction "
                        f"({first.get('min_eye_fraction', 0.05)}) of its non-mask classified images; an eye class "
@@ -483,7 +841,9 @@ def build_workbook(results_path: Path | list[Path], out_path: Path, model_meta: 
                        "seen in a mask-dominated record (review only, not present)', its CMDS structure has no "
                        "modality directories and its weblinks are catalogued. A record with "
                        f"{MASK_DOMINATED_MIN_NON_MASK} or more non-mask "
-                       "images follows the normal rule whatever its mask share. Rows from runs before survey "
+                       "images follows the normal rule whatever its mask share, and so does a record whose "
+                       "non-mask images hold at least 10 images of one eye class other than OCTA with mean "
+                       "confidence at least 0.75 (photos next to their masks). Rows from runs before survey "
                        "version 3 used a 1% per-class rule over all images; rows before version 4 have no "
                        "mask_dominated status and an older mask check."),
         ("Remote byte bounds", f"Remote zip members over --remote-max-member-mb "
@@ -561,143 +921,12 @@ def build_workbook(results_path: Path | list[Path], out_path: Path, model_meta: 
                             "CMDS_JSON sheet. Records that ended without a classification (skipped_disk, error, "
                             "crashed) get metadata-only documents from the Zenodo metadata (empty directoryList; "
                             "see the CMDS note column)."),
-        ("Weblinks", "Records with no files, no usable image files, images of no eye modality (status "
+        ("Weblinks", "Records with no files, no image files, unreadable images, images of no eye modality (status "
                      "no_eye_images) or mostly masks (status mask_dominated): every external link, cleaned, categorised by domain, flagged "
                      "dataset_likely, with an HTTP status check when enabled (429 and 5xx answers are retried "
                      "on the next run, not cached)."),
     ]
-    for k, v in readme:
-        ws.append([k, v])
-    ws["A1"].font = Font(bold=True, size=14)
-    for r in ws.iter_rows(min_row=2):
-        r[0].font = Font(bold=True)
-        r[1].alignment = Alignment(wrap_text=True, vertical="top")
-    ws.column_dimensions["A"].width = 32
-    ws.column_dimensions["B"].width = 120
-
-    # ---- Records
-    table(wb.create_sheet("Records"), RECORD_COLUMNS, rows)
-
-    # ---- Record_Classes
-    rc_rows = []
-    for r in rows:
-        detail = r.get("_class_detail") or {}
-        per_class = r.get("dicom_per_class") or {}
-        for cls, info in detail.items():
-            d = per_class.get(cls) or {}
-            dtype, mdir, _ = CLASS_DIRS.get(cls, ("", "", ""))
-            rc_rows.append({
-                "record_id": r["record_id"], "title": r.get("title"), "class": cls,
-                "label": CLASS_LABELS.get(cls), "n_sampled": info.get("count"),
-                "frac": r.get(f"frac_{cls}"), "est_files": info.get("est_files"),
-                "mean_conf": round(info.get("mean_conf") or 0, 4),
-                "cmds_dir": f"{dtype}/{mdir}", **{f"dicom_{k}": v for k, v in d.items()},
-            })
-    rc_cols = [("record_id", "Zenodo record id"), ("title", "Title"), ("class", "Class"), ("label", "Label"),
-               ("n_sampled", "Sampled images"), ("frac", "Fraction of sample"), ("est_files", "Estimated files"),
-               ("mean_conf", "Mean confidence"), ("cmds_dir", "CMDS directory"),
-               ("dicom_Modality", "Modality"), ("dicom_SOPClassUID", "SOP Class UID"),
-               ("dicom_SOPClassName", "SOP Class name"), ("dicom_ImageType", "Image Type"),
-               ("dicom_BodyPartExamined", "Body Part Examined"), ("dicom_AnatomicRegion", "Anatomic Region"),
-               ("dicom_AcquisitionDeviceType", "Acquisition Device Type"),
-               ("dicom_LightPathFilter", "Light Path Filter"), ("dicom_ChannelDescription", "Channel Description"),
-               ("dicom_SamplesPerPixelUsed", "Samples Per Pixel Used"),
-               ("dicom_OphthalmicImageType", "Ophthalmic Image Type"),
-               ("dicom_IlluminationType", "Illumination Type")]
-    table(wb.create_sheet("Record_Classes"), rc_cols, rc_rows, freeze="D2")
-
-    # ---- Weblinks
-    wl_rows = []
-    for r in rows:
-        for link in r.get("weblinks") or []:
-            wl_rows.append({"record_id": r["record_id"], "record_title": r.get("title"),
-                            "record_status": r.get("status"), **link})
-    table(wb.create_sheet("Weblinks"), WEBLINK_COLUMNS, wl_rows, freeze="D2", link_cols=("url", "final_url"))
-
-    # ---- DICOM_Mapping (reference)
-    m = mapping()
-    dm_rows = []
-    for cls in CLASSES:
-        s = m["classes"][cls]
-        code = lambda c: "" if not c else ("; ".join(code(x) for x in c) if isinstance(c, list)  # noqa: E731
-                                           else f"{c.get('CodingSchemeDesignator')} {c.get('CodeValue')} {c.get('CodeMeaning')}")
-        dtype, mdir, _ = CLASS_DIRS.get(cls, ("(none)", "", ""))
-        dm_rows.append({
-            "class": cls, "label": s.get("label"), "Modality": s.get("Modality_0008_0060"),
-            "Modality_meaning": s.get("Modality_meaning"), "SOPClassUID": s.get("SOPClassUID_0008_0016"),
-            "SOPClassName": s.get("SOPClassName"),
-            "SOPClassUID_16bit": "; ".join(v for v in (
-                s.get("SOPClassUID_if_16bit"), s.get("SOPClassUID_alternative_if_native_projection")) if v),
-            "ImageType": "\\".join(s.get("ImageType_0008_0008") or []),
-            "BodyPart": s.get("BodyPartExamined_0018_0015") or "",
-            "Anatomic": code(s.get("AnatomicRegionSequence_0008_2218")),
-            "Device": code(s.get("AcquisitionDeviceTypeCodeSequence_0022_0015")),
-            "Filter": code(s.get("LightPathFilterTypeStackCodeSequence_0022_0017")),
-            "Channel": code(s.get("ChannelDescriptionCodeSequence_0022_001A")),
-            "Photometric": s.get("expected_PhotometricInterpretation") or "",
-            "cmds_dir": f"{dtype}/{mdir}" if mdir else "(not a CMDS directory)",
-            "notes": s.get("notes"),
-        })
-    dm_cols = [("class", "Class"), ("label", "Label"), ("Modality", "Modality (0008,0060)"),
-               ("Modality_meaning", "Modality meaning"), ("SOPClassUID", "SOP Class UID"),
-               ("SOPClassName", "SOP Class name"), ("SOPClassUID_16bit", "Alternative SOP Class UID"),
-               ("ImageType", "Image Type"), ("BodyPart", "Body Part Examined"), ("Anatomic", "Anatomic Region"),
-               ("Device", "Acquisition Device Type"), ("Filter", "Light Path Filter"),
-               ("Channel", "Channel Description"), ("Photometric", "Expected Photometric Interpretation"),
-               ("cmds_dir", "CMDS directory"), ("notes", "Notes")]
-    table(wb.create_sheet("DICOM_Mapping"), dm_cols, dm_rows, freeze="B2")
-
-    # ---- Schema_Fields
-    prov_counts: dict[tuple[str, str], Counter] = defaultdict(Counter)
-    for r in rows:
-        for fld, src in (r.get("cmds_provenance") or {}).items():
-            prov_counts[("dataset_description", fld)][src] += 1
-    sf_rows = []
-    for schema, fld, req, rule in SCHEMA_FIELDS:
-        c = prov_counts.get((schema, fld), Counter())
-        if schema == "dataset_description":
-            filled = sum(c.values())
-        elif fld == "directoryList":
-            # Records without an eye modality get an empty directoryList.
-            filled = sum(1 for r in rows if r.get("cmds_directories"))
-        else:
-            filled = sum(1 for r in rows if r.get("cmds_dir"))
-        sf_rows.append({"schema": schema, "field": fld, "required": "yes" if req else "no", "rule": rule,
-                        "records": filled,
-                        "sources": "; ".join(f"{k} ({v})" for k, v in c.most_common())})
-    sf_cols = [("schema", "Schema"), ("field", "Field"), ("required", "Required"), ("rule", "Mapping rule"),
-               ("records", "Records filled"), ("sources", "Sources used (records)")]
-    table(wb.create_sheet("Schema_Fields"), sf_cols, sf_rows, freeze="C2")
-
-    # ---- CMDS_JSON: the two conformant documents per record, as text
-    cj_rows = []
-    for r in rows:
-        if not r.get("cmds_dir"):
-            continue
-        folder = Path(r["_cmds_folder"])
-        docs = {}
-        for name in ("dataset_description", "dataset_structure_description"):
-            try:
-                txt = (folder / f"{name}.json").read_text(encoding="utf-8")
-            except OSError:
-                txt = ""
-            if len(txt) > _CELL_MAX:
-                txt = txt[:_CELL_MAX] + "\n... [truncated; see the JSON file]"
-            docs[name] = txt
-        cj_rows.append({"record_id": r["record_id"], "cmds_folder": r["cmds_folder"],
-                        "dd_valid": r.get("dd_valid"), "dsd_valid": r.get("dsd_valid"),
-                        "dataset_description": docs["dataset_description"],
-                        "dataset_structure_description": docs["dataset_structure_description"]})
-    cj_cols = [("record_id", "Zenodo record id"), ("cmds_folder", "CMDS JSON folder (results dir + cmds/<id>)"),
-               ("dd_valid", "dataset_description valid"), ("dsd_valid", "dataset_structure_description valid"),
-               ("dataset_description", "dataset_description.json"),
-               ("dataset_structure_description", "dataset_structure_description.json")]
-    table(wb.create_sheet("CMDS_JSON"), cj_cols, cj_rows, freeze="B2")
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(out_path)
-    return {"records": len(rows), "weblinks": len(wl_rows), "record_classes": len(rc_rows),
-            "status": dict(status), "path": str(out_path)}
+    return readme
 
 
 def _parity_text(meta: dict) -> str:

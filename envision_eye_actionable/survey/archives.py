@@ -6,8 +6,8 @@ survey lists archive members instead and later reads only the sampled ones:
 * zip: ``zipfile`` central directory (instant). Members using compression
   Python cannot read (deflate64, bzip2 variants in old zips, spanned sets)
   are read through the ``7z`` binary instead.
-* tar family: one streaming pass to list, one streaming pass to read the
-  sampled members (no seeking, no member table kept for reading).
+* tar family (zstd too): one streaming pass to list, one streaming pass to
+  read the sampled members (no seeking, no member table kept for reading).
 * 7z, rar, spanned zip (.zip + .z01..): ``7z l -slt`` to list, ``7z x`` with a
   list file to extract only the sampled members into a temp dir. RAR members
   are extracted with ``unrar`` because many 7z builds cannot decode RAR.
@@ -17,6 +17,18 @@ survey lists archive members instead and later reads only the sampled ones:
 Nested archives (zip in zip, tar in zip, ...) are extracted one member at a
 time into the record's scratch dir and walked recursively up to ``max_depth``.
 Single-file compressed members (x.tif.gz) are decompressed the same way.
+
+Extensionless members (and files) are sniffed by their first bytes
+(constants.sniff_kind: DICOM with or without the preamble, PNG, JPEG, TIFF,
+BMP). A volume header member (x.mhd, x.hdr) is read together with its data
+member (x.raw, x.img) from the same directory: both are extracted under
+their own names into one scratch directory.
+
+Large zips written without ZIP64 records (32-bit offsets that wrapped past
+4 GiB) make ``zipfile`` shift every member's offset; a member whose local
+header is not where the central directory says is looked up at the offsets
+4 GiB apart (``open_zip_member``). Deflate64 members are read through
+zipfile-deflate64 when it is installed, else through 7z.
 """
 
 from __future__ import annotations
@@ -28,6 +40,7 @@ import lzma
 import logging
 import os
 import shutil
+import struct
 import subprocess
 import tarfile
 import tempfile
@@ -39,9 +52,15 @@ from typing import Iterator
 
 from ..unpack import unpack_archive
 from .constants import (
-    IMAGE_KINDS, RAR_EXTS, SEVEN_ZIP_EXTS, TAR_EXTS, ZIP_EXTS,
-    detect_ext, file_kind, nested_worth,
+    IMAGE_KINDS, PATH_KINDS, RAR_EXTS, SEVEN_ZIP_EXTS, SNIFF_BYTES, TAR_EXTS, ZIP_EXTS,
+    detect_ext, file_kind, nested_worth, sniff_kind, split_first, volume_companion,
 )
+
+try:                    # registers Deflate64 (method 9) with zipfile
+    import zipfile_deflate64  # noqa: F401
+    _DEFLATE64 = True
+except Exception:  # noqa: BLE001 - optional; 7z reads Deflate64 too
+    _DEFLATE64 = False
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +69,7 @@ SEVEN_ZIP = shutil.which("7z") or shutil.which("7za") or shutil.which("7zz")
 # ("Unsupported Method"), so RAR members are extracted with unrar when present.
 UNRAR = shutil.which("unrar")
 # zipfile can read stored(0), deflate(8), bzip2(12), lzma(14).
-_PY_ZIP_METHODS = {0, 8, 12, 14}
+_PY_ZIP_METHODS = {0, 8, 12, 14} | ({9} if _DEFLATE64 else set())
 DICM_MAGIC_OFFSET = 128
 
 
@@ -61,8 +80,9 @@ class Entry:
     member: str             # member name inside the container, or absolute path
     display: str            # record-relative display path, "a.zip!/x/y.png"
     ext: str
-    kind: str               # raster | dicom | volume
+    kind: str               # an IMAGE_KINDS kind
     size: int
+    companion: str | None = None   # volume_pair: the data member (same directory)
 
 
 @dataclass
@@ -90,6 +110,7 @@ class RecordWalker:
     entries: list[Entry] = field(default_factory=list)
     kind_counts: Counter = field(default_factory=Counter)
     image_ext_counts: Counter = field(default_factory=Counter)
+    member_ext_counts: Counter = field(default_factory=Counter)   # every archive member listed, by extension
     other_names: list[str] = field(default_factory=list)   # sample, for text hints
     errors: list[str] = field(default_factory=list)
     _nested_n: int = 0
@@ -99,12 +120,14 @@ class RecordWalker:
     def add_file(self, path: Path, display: str, depth: int = 0):
         """Register a top-level (or decompressed) file."""
         kind = file_kind(path.name)
-        if kind == "noext" and _is_dicom_file(path):
-            kind = "dicom"
+        ext = detect_ext(path.name)
+        if kind in ("noext", "other"):
+            sniffed = _sniff_file(path)
+            if sniffed is not None and (kind == "noext" or sniffed[0] == "dicom"):
+                kind, ext = sniffed
         self.kind_counts[kind] += 1
         if kind in IMAGE_KINDS:
-            ext = detect_ext(path.name) or ".dcm"
-            self._add_entry(Entry(-1, str(path), display, ext, kind, _size(path)))
+            self._add_entry(Entry(-1, str(path), display, ext or ".dcm", kind, _size(path)))
         elif kind == "archive":
             self._walk_archive(path, display, depth)
         elif kind == "compressed":
@@ -139,7 +162,8 @@ class RecordWalker:
                 self._walk_zip(path, display, depth)
             elif ext in TAR_EXTS:
                 self._walk_tar(path, display, depth)
-            elif ext in SEVEN_ZIP_EXTS or ext in RAR_EXTS or low.endswith(".7z.001"):
+            elif ext in SEVEN_ZIP_EXTS or ext in RAR_EXTS or split_first(low):
+                # 7z opens any numbered split set (x.7z.001, x.tar.001, x.001)
                 self._walk_7z(path, display, depth)
             else:
                 self._note_other(display)
@@ -155,25 +179,32 @@ class RecordWalker:
         self.containers.append(Container(kind, path, display, depth))
         return len(self.containers) - 1
 
-    def _member(self, ci: int, name: str, size: int, depth: int, opener=None):
-        """Classify one archive member; recurse into nested archives."""
+    def _member(self, ci: int, name: str, size: int, depth: int, opener=None, siblings=None):
+        """Classify one archive member; recurse into nested archives.
+        ``siblings``: every member name of the container (volume pairs)."""
         c = self.containers[ci]
         c.n_members += 1
         disp = f"{c.display}!/{name}"
         kind = file_kind(name)
+        ext = detect_ext(name)
+        self.member_ext_counts[ext or "(none)"] += 1
         if kind == "noext" and opener is not None and self._sniffed < self.noext_sniff_limit \
-                and 132 <= size < (64 << 20):
+                and 8 <= size < (64 << 20):
             self._sniffed += 1
             try:
                 with opener() as fp:
-                    head = fp.read(132)
-                if head[DICM_MAGIC_OFFSET:DICM_MAGIC_OFFSET + 4] == b"DICM":
-                    kind = "dicom"
+                    head = fp.read(SNIFF_BYTES)
+                sniffed = sniff_kind(head)
+                if sniffed is not None:
+                    kind, ext = sniffed
             except Exception:  # noqa: BLE001
                 pass
         self.kind_counts[kind] += 1
         if kind in IMAGE_KINDS:
-            self._add_entry(Entry(ci, name, disp, detect_ext(name) or ".dcm", kind, size))
+            comp = None
+            if kind == "volume_pair" and siblings is not None:
+                comp = volume_companion(name, siblings)
+            self._add_entry(Entry(ci, name, disp, ext or ".dcm", kind, size, comp))
         elif (kind in ("archive", "compressed") and depth < self.max_depth
               and _nested_worth(name, kind)):
             nested = self._extract_nested(ci, name, size)
@@ -266,19 +297,24 @@ class RecordWalker:
             use_7z = any(i.compress_type not in _PY_ZIP_METHODS for i in infos) and bool(SEVEN_ZIP)
             ci = self._new_container("zip" if not use_7z else "7z", path, display, depth)
             self.containers[ci].use_7z = use_7z
+            names = [i.filename for i in infos]
             for info in infos:
                 if info.flag_bits & 0x1:
                     self.kind_counts["encrypted"] += 1
                     continue
                 opener = None
                 if not use_7z:
-                    opener = (lambda n=info.filename: zf.open(n))
-                self._member(ci, info.filename, info.file_size, depth, opener)
+                    opener = (lambda i=info: open_zip_member(zf, i))
+                self._member(ci, info.filename, info.file_size, depth, opener, siblings=names)
 
     def _walk_tar(self, path: Path, display: str, depth: int):
         ci = self._new_container("tar", path, display, depth)
-        with tarfile.open(path, mode="r|*") as tf:
+        names: list[str] = []
+        n0 = len(self.entries)
+        with open_tar_stream(path) as tf:
             for m in tf:
+                if m.isfile():
+                    names.append(m.name)
                 if not m.isfile():
                     continue
                 kind = file_kind(m.name)
@@ -309,6 +345,11 @@ class RecordWalker:
                 if kind == "noext":
                     opener = (lambda mm=m: _Closing(tf.extractfile(mm)))
                 self._member(ci, m.name, m.size, depth, opener)
+        # A tar is listed in one streaming pass: volume headers learn their
+        # data member once every name is known.
+        for e in self.entries[n0:]:
+            if e.container == ci and e.kind == "volume_pair" and e.companion is None:
+                e.companion = volume_companion(e.member, names)
 
     def _walk_7z(self, path: Path, display: str, depth: int):
         if not SEVEN_ZIP:
@@ -334,8 +375,9 @@ class RecordWalker:
             if not is_rar:
                 raise
             listing = _rar_list(path)
+        names = [n for n, _ in listing]
         for name, size in listing:
-            self._member(ci, name, size, depth, None)
+            self._member(ci, name, size, depth, None, siblings=names)
 
     def _decompress_single(self, path: Path, display: str, depth: int):
         """x.tif.gz -> x.tif (only when the inner file is something we read)."""
@@ -343,7 +385,7 @@ class RecordWalker:
         if file_kind(inner) not in IMAGE_KINDS | {"archive", "noext"} or depth >= self.max_depth:
             self._note_other(display)
             return
-        opener = {".gz": gzip.open, ".bz2": bz2.open, ".xz": lzma.open}.get(detect_ext(path.name))
+        opener = {".gz": gzip.open, ".bz2": bz2.open, ".xz": lzma.open, ".zst": _zstd_open}.get(detect_ext(path.name))
         if opener is None:
             return
         # Budget: assume up to 10x expansion when checking the disk floor.
@@ -409,12 +451,34 @@ class RecordWalker:
             shutil.copyfileobj(data_src, out, 1 << 20)
         return Path(name)
 
+    def _pair_dir(self) -> Path:
+        """Fresh scratch dir for a volume header and its data file (both keep
+        their own base names there, as the header refers to the data file)."""
+        (self.scratch / "spill").mkdir(parents=True, exist_ok=True)
+        return Path(tempfile.mkdtemp(dir=self.scratch / "spill", prefix="pair_"))
+
+    @staticmethod
+    def _save_as(src, dest: Path) -> Path:
+        with open(dest, "wb") as out:
+            shutil.copyfileobj(src, out, 1 << 20)
+        return dest
+
     def _read_zip(self, c: Container, group: list[Entry], max_inmem: int):
         with zipfile.ZipFile(c.path) as zf:
             for e in group:
                 try:
-                    with zf.open(e.member) as src:
-                        if e.kind == "volume" or e.size > max_inmem:
+                    if e.kind == "volume_pair" and e.companion:
+                        d = self._pair_dir()
+                        try:
+                            for name in (e.member, e.companion):
+                                with open_zip_member(zf, zf.getinfo(name)) as src:
+                                    self._save_as(src, d / PurePosixPath(name).name)
+                            yield e, None, d / PurePosixPath(e.member).name, None
+                        finally:
+                            shutil.rmtree(d, ignore_errors=True)
+                        continue
+                    with open_zip_member(zf, zf.getinfo(e.member)) as src:
+                        if e.kind in PATH_KINDS or e.size > max_inmem:
                             p = self._spill(src, e)
                             try:
                                 yield e, None, p, None
@@ -427,30 +491,65 @@ class RecordWalker:
 
     def _read_tar(self, c: Container, group: list[Entry], max_inmem: int):
         wanted = {e.member: e for e in group}
+        # Volume pairs: both members are saved as they stream past, and the
+        # header is yielded once its data member is there too.
+        pair_of = {e.companion: e for e in group if e.kind == "volume_pair" and e.companion}
+        pair_dirs: dict[int, Path] = {}
+        pair_got: dict[int, int] = {}
         seen = set()
-        with tarfile.open(c.path, mode="r|*") as tf:
-            for m in tf:
-                e = wanted.get(m.name)
-                if e is None or m.name in seen or not m.isfile():
-                    continue
-                seen.add(m.name)
-                src = tf.extractfile(m)
-                if src is None:
-                    yield e, None, None, "not a regular file"
-                    continue
-                if e.kind == "volume" or e.size > max_inmem:
-                    p = self._spill(src, e)
-                    try:
-                        yield e, None, p, None
-                    finally:
-                        p.unlink(missing_ok=True)
-                else:
-                    yield e, src.read(), None, None
-                if len(seen) == len(wanted):
-                    break
+        try:
+            with open_tar_stream(c.path) as tf:
+                for m in tf:
+                    if not m.isfile():
+                        continue
+                    e = wanted.get(m.name)
+                    if e is not None and m.name in seen:
+                        e = None
+                    pe = pair_of.get(m.name)
+                    if e is None and pe is None:
+                        continue
+                    src = tf.extractfile(m)
+                    if src is None:
+                        if e is not None:
+                            seen.add(m.name)
+                            yield e, None, None, "not a regular file"
+                        continue
+                    pair_e = e if (e is not None and e.kind == "volume_pair" and e.companion) else pe
+                    if pair_e is not None:
+                        k = id(pair_e)
+                        if k not in pair_dirs:
+                            pair_dirs[k] = self._pair_dir()
+                        d = pair_dirs[k]
+                        self._save_as(src, d / PurePosixPath(m.name).name)
+                        pair_got[k] = pair_got.get(k, 0) + 1
+                        if e is not None:
+                            seen.add(m.name)
+                        if pair_got[k] == 2:
+                            try:
+                                yield pair_e, None, d / PurePosixPath(pair_e.member).name, None
+                            finally:
+                                shutil.rmtree(d, ignore_errors=True)
+                                pair_dirs.pop(k, None)
+                        continue
+                    seen.add(m.name)
+                    if e.kind in PATH_KINDS or e.size > max_inmem:
+                        p = self._spill(src, e)
+                        try:
+                            yield e, None, p, None
+                        finally:
+                            p.unlink(missing_ok=True)
+                    else:
+                        yield e, src.read(), None, None
+                    if len(seen) == len(wanted) and not pair_dirs:
+                        break
+        finally:
+            for d in pair_dirs.values():
+                shutil.rmtree(d, ignore_errors=True)
         for name, e in wanted.items():
             if name not in seen:
                 yield e, None, None, "member not found on second pass"
+            elif e.kind == "volume_pair" and e.companion and pair_got.get(id(e), 0) < 2:
+                yield e, None, None, "volume data member not found on second pass"
 
     def _read_7z(self, c: Container, group: list[Entry], chunk: int = 400,
                  max_chunk_bytes: int = 20_000_000_000):
@@ -481,7 +580,11 @@ class RecordWalker:
                 continue
             out_dir = Path(tempfile.mkdtemp(dir=self.scratch, prefix="x7z_"))
             try:
-                got = _extract_members(c, [e.member for e in part], out_dir)
+                # 7z and unrar keep member paths: a volume header and its data
+                # member land in the same directory.
+                names = [e.member for e in part] + [e.companion for e in part
+                                                    if e.kind == "volume_pair" and e.companion]
+                got = _extract_members(c, names, out_dir)
                 for e in part:
                     p = got.get(e.member)
                     if p is None or not p.exists() or (e.size and p.stat().st_size == 0):
@@ -510,6 +613,102 @@ class _Closing:
 
 
 _nested_worth = nested_worth   # shared with constants.wanted_for_download
+
+
+# ---------------------------------------------------------------------------
+# zip members at wrapped offsets, zstd tars, sniffing
+# ---------------------------------------------------------------------------
+_4GIB = 1 << 32
+
+
+def wrapped_offsets(header_offset: int, archive_size: int) -> list[int]:
+    """Candidate local header offsets of a member whose central directory
+    offset may be off by a multiple of 4 GiB: zips over 4 GiB written
+    without ZIP64 records store offsets modulo 2**32, and zipfile then adds
+    the same 4 GiB multiple to every member. Candidates are the given
+    offset shifted down and up by whole 4 GiB steps inside the archive."""
+    out = []
+    k = header_offset - _4GIB
+    while k >= 0:
+        out.append(k)
+        k -= _4GIB
+    k = header_offset + _4GIB
+    while k + 30 <= archive_size:
+        out.append(k)
+        k += _4GIB
+    return out
+
+
+def local_header_matches(head: bytes, info) -> bool:
+    """The bytes at a candidate offset are the local header of ``info``:
+    signature and file name (the name is compared when it was read)."""
+    if len(head) < 30 or head[:4] != b"PK\x03\x04":
+        return False
+    n_len = struct.unpack("<H", head[26:28])[0]
+    name = head[30:30 + n_len]
+    if len(name) < n_len:
+        return False
+    want = info.orig_filename.encode("utf-8" if info.flag_bits & 0x800 else "cp437", "replace")
+    return name.replace(b"\\", b"/") == want.replace(b"\\", b"/")
+
+
+def open_zip_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo):
+    """zf.open(info), looking the member up at 4 GiB-shifted offsets when
+    its local header is not where the central directory says (see
+    wrapped_offsets)."""
+    try:
+        return zf.open(info)
+    except zipfile.BadZipFile as first:
+        fp = zf.fp
+        try:
+            fp.seek(0, 2)
+            size = fp.tell()
+        except Exception:  # noqa: BLE001
+            raise first from None
+        n = 30 + len(info.orig_filename.encode("utf-8", "replace")) + 8
+        for cand in wrapped_offsets(info.header_offset, size):
+            fp.seek(cand)
+            if local_header_matches(fp.read(n), info):
+                import copy
+                fixed = copy.copy(info)
+                fixed.header_offset = cand
+                return zf.open(fixed)
+        raise first from None
+
+
+def _zstd_open(path, mode="rb"):
+    import zstandard
+    return zstandard.open(path, mode)
+
+
+def open_tar_stream(path: Path):
+    """tarfile in streaming mode for every tar compression, zstd included
+    (tarfile itself reads zstd only from Python 3.14)."""
+    low = str(path).lower()
+    if low.endswith((".tar.zst", ".tzst")):
+        import zstandard
+        fp = open(path, "rb")
+        reader = zstandard.ZstdDecompressor().stream_reader(fp)
+        tf = tarfile.open(fileobj=reader, mode="r|")
+        _close = tf.close
+
+        def close():
+            try:
+                _close()
+            finally:
+                reader.close()
+                fp.close()
+        tf.close = close
+        return tf
+    return tarfile.open(path, mode="r|*")
+
+
+def _sniff_file(p: Path):
+    try:
+        with open(p, "rb") as fp:
+            return sniff_kind(fp.read(SNIFF_BYTES))
+    except OSError:
+        return None
 
 
 def _size(p: Path) -> int:

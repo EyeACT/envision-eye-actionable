@@ -173,8 +173,8 @@ Three things are then shared through that dir:
   one extending the per-IP penalty;
 - the request budget: every request is logged in `zenodo_requests` under a
   file lock, and a request goes out only while all the processes together
-  sent fewer than `--shared-rpm` (110) in the last 60 s. Two processes left
-  at the default `--rpm 110` therefore cannot send 220 per minute; `--rpm`
+  sent fewer than `--shared-rpm` (120) in the last 60 s. Two processes left
+  at the default `--rpm 120` therefore cannot send 240 per minute; `--rpm`
   still caps each process on its own, so it sets a process's share (90 and
   20 below);
 - the disk floor: before downloading, a process publishes the bytes it is
@@ -232,33 +232,345 @@ Main options (`envision-survey run --help` lists all of them):
 | `--threshold` | 0.6 | top-1 probability below this is UNCERTAIN |
 | `--disk-floor-gb` | 80 | skip a record (`skipped_disk`) if its download would leave less free space |
 | `--download-workers` | 3 | parallel downloads and member fetches per record |
-| `--rpm` (or `--zenodo-rpm`) | 110 | Zenodo requests per sliding minute for this process, all threads together (Zenodo allows about 133 per IP); with `--shared-state-dir` it sets this process's share, e.g. 90 + 20 |
+| `--rpm` (or `--zenodo-rpm`) | 120 | Zenodo requests per sliding minute for this process, all threads together (Zenodo allows 133 per 60 s window per IP and User-Agent); with `--shared-state-dir` it sets this process's share, e.g. 90 + 20 |
 | `--shared-state-dir` | none | dir shared by processes running at the same time: a 429 in one pauses all of them, their requests together stay under `--shared-rpm`, and each subtracts the others' in-flight downloads on the same disk before checking the disk floor |
-| `--shared-rpm` | 110 | Zenodo requests per sliding minute of all the processes sharing `--shared-state-dir` together; ignored without it |
+| `--shared-rpm` | 120 | Zenodo requests per sliding minute of all the processes sharing `--shared-state-dir` (or the pipeline's `--state-dir`) together; ignored without either |
+| `--triage-cap` | 50 | two-pass sampling: images classified first from each source; only records whose triage sample holds eye classes get the deep sample (see Two-pass sampling); 0 turns it off |
 | `--zenodo-interval` | 0.5 | minimum seconds between two Zenodo requests |
 | `--download-all` | off | also fetch documents, tables, code and arrays |
 | `--min-eye-fraction` | 0.05 | a record has eye images (status `ok`) only when the eye classes make up at least this fraction of its non-mask classified images (thresholded labels) |
 | `--min-class-fraction` | 0.01 | in a record with eye images, fraction of the non-mask classified images for an eye class to be listed as present |
 | `--ids`, `--ids-file` | all records | only these record ids; `--ids-file` (repeatable) reads them from a file, one per line, e.g. from `partition` |
 | `--no-link-check` | off | skip HTTP HEAD checks of weblinks |
-| `--retry-status` | none | reprocess records with these statuses, e.g. `error,skipped_disk,skipped_size,remote_listing_failed,ok_partial_download` |
+| `--retry-status` | none | reprocess records with these statuses, e.g. `error,skipped_disk,skipped_size,remote_listing_failed,ok_partial_download,images_unreadable` |
+| `--no-archive-probe` | off | download non-zip archives whole without reading their listing first (see Archive probe) |
+| `--archive-probe-mb` | 64 | bytes read at most per archive probe; a compressed tar is listed from its first this many MB |
+| `--archive-probe-max-requests` | 50 | range requests at most per archive probe |
+| `--series-sample-k` | 3 | top-level image files downloaded per homogeneous series of large files (same kind, extension and name with digits masked, each at least `--series-min-mb`); the rest are counted only; 0 downloads every file |
+| `--series-min-mb` | 64 | file size from which `--series-sample-k` applies |
+| `--token-file` | `~/.config/envision-survey/zenodo_token` when it exists | file holding a Zenodo access token (one line); `ZENODO_TOKEN` in the environment wins |
+| `--metadata-cache-dir` | `<out-dir>/cache` | where record metadata fetched from Zenodo is cached (`legacy/`, `datacite/`); point several runs at one dir to fetch each record once |
+
+**Zenodo token.** With `ZENODO_TOKEN` set, `--token-file`, or the default
+token file `~/.config/envision-survey/zenodo_token` (read when it exists
+and neither of the others is given), requests to zenodo.org carry
+`Authorization: Bearer <token>`. An explicit `--token-file` that does not
+exist stops the command. Measured on the VM, the
+token does not raise the rate limit (the bucket is keyed by IP and User
+Agent, 133 requests per 60 s window whatever the auth); it only opens
+records the account was granted. The token goes to zenodo.org hosts only
+(never to another host, never on a redirect elsewhere, never through the
+weblink checker, which has its own session), and it is never logged,
+printed or written to results, events, the workbook or CMDS files: the
+run config in the events file holds the token file path, not the token.
+As a second line of defence the token string is registered for redaction
+when it is loaded: every results line, event line, predictions line, CMDS
+file, status file and pipeline JSONL line, and every log record (a filter
+on the log handlers, tracebacks included), has it replaced by
+`[REDACTED]` should it ever turn up in a message or a file name. The
+pipeline passes `--token-file` (a path) to its child processes, never the
+token, so it does not appear in a process list either; only the `fetch`
+role loads it (the `process` role makes no Zenodo API request). Keep the
+token file outside the repo with mode 600, and never pass the token on a
+command line.
+
+## Full pull: `pipeline` (fetch, process, monitor)
+
+`run` does everything in one process, one record at a time: a record that
+downloads a 5 GB tar at 1 MB/s holds up the classifier for more than an
+hour, and the classifier holds up the downloads. The full keyword pull
+(about 30,500 records, several TB listed, about 120 Zenodo requests per
+minute) is instead split over three processes that share a spool dir and
+a state dir:
+
+```
+             Zenodo (one throttle, --rpm)
+                      |
+          +-----------v-----------+   deep / refetch requests   +---------------------+
+          | fetch (producer)      |<----------------------------| process (consumer)  |
+          | metadata, plan, probe |                             | walk, convert,      |
+          | remote zip members,   |  spool/records/<id>/ READY  | classify (ONNX),    |
+          | top-level images,     |---------------------------->| rows, CMDS, preds,  |
+          | whole archives        |                             | weblinks; deletes   |
+          +-----------------------+                             | the spool dir       |
+                      |                                         +---------------------+
+                      +----------> state dir <-------- monitor (status.json every --interval s)
+```
+
+- **fetch** plans every record of the scrape from its Zenodo record JSON,
+  reads what can be read remotely (zip members through the container API
+  or range reads, top-level image files one by one, archive listings by
+  range reads: see Archive probe) and downloads whole only the archives
+  that cannot be read remotely and whose probe allows it. Each record goes
+  into `<spool>/records/<id>/` with a `manifest.json` (written and fsynced
+  first) and then a `READY` marker. It runs `--fetch-workers` records at
+  once (default 4), each with `--download-workers` streams (default 2 to
+  3), all under the one request budget. Files of the discovery downloads
+  dir are never copied into the spool: the manifest names them by path
+  and the consumer reads them in place.
+- **process** takes `READY` records oldest first, re-validates every
+  spooled file (exists, same size as recorded; local originals exist),
+  classifies them (format conversion, MASK, UNCERTAIN, two-pass sampling,
+  below), appends the result row with flush and fsync, writes CMDS JSON,
+  predictions and the weblink catalogue, and only then deletes the
+  record's spool dir. It is the only process that writes
+  `survey_results.jsonl` and it makes no Zenodo API request of its own (the
+  metadata comes from the cache the producer filled; weblink checks of
+  zenodo.org links, including each redirect hop and the GET that follows a
+  refused HEAD, count against the same request budget through the state
+  dir, and their rate-limit headers pause the producer too). On SIGTERM or
+  SIGINT it finishes the current record and exits 0; the record's attempt
+  count is restored at once, so a stop is never counted as a crash.
+- **monitor** writes `<state>/status.json` every `--interval` seconds
+  (default 60) and appends the same snapshot to `monitor.jsonl`: free disk,
+  spool size and records by state, pending requests, results by status,
+  rows finished in the last hour, ETA, and each role's liveness, state,
+  counters, current records and the producer's wait reason.
+- **pipeline** starts fetch (and waits until it holds its lock), then
+  process and monitor, each with the same options and its own log
+  `<state>/logs/<role>.log`. A fetch or process that exits with a
+  non-zero code (a crash, an out-of-memory kill) is logged as
+  `role_crashed` in `<state>/pipeline_events.jsonl` and in
+  `<state>/pipeline_status.json` (which the monitor includes) and started
+  again (`role_restarted`) after `--restart-backoff-s` (default 10,
+  doubled per restart, at most 300 s), at most `--max-role-restarts`
+  (default 20) times per role; then it is given up (`role_given_up`). A
+  record that kills the consumer on every start is stopped by the attempts
+  guard (status `crashed`), and the survey goes on with the next record.
+  A process that ends cleanly (exit 0; it stops when fetch has been gone
+  for a few polls) while fetch still runs is started again after
+  `--restart-backoff-s`, and one that ended while fetch waits for its
+  restart starts again with fetch. Such clean restarts are counted apart
+  (`clean_restarts`) and neither use up `--max-role-restarts` nor grow the
+  backoff, so a fetch that crashes now and then never gets process given
+  up. The pipeline ends once fetch and process have both ended and no
+  restart is pending, with exit code 1 when a role was given up or ended
+  with a non-zero code.
+
+### Two-pass sampling
+
+Every sampled source (local and downloaded files; remote zip members and
+top-level image files fetched one by one) is put in one seeded order. The
+triage pass classifies the first `--triage-cap` (default 50) of each
+source. Only when the eye classes make up at least `--min-eye-fraction` of
+the triage sample's non-mask images (thresholded labels) does the deep
+pass follow: the rest of the same orders, up to `--max-images` (2000) for
+local and downloaded files and `--remote-cap` (300) for remote members.
+The triage images are kept and part of the deep sample; nothing is
+fetched twice.
+
+- Remote members: the producer fetches only the triage members first. The
+  seeded order does not depend on the cap (each zip's candidates are
+  shuffled once, and a zip contributes the first members of its order;
+  the per-zip quota of the larger cap is never below the triage one), so
+  the triage sample is a prefix of the deep sample. When the consumer needs
+  the deep pass it marks the record `AWAITING_DEEP`, appends an
+  `awaiting_deep` line to the results, and writes a deep request; the
+  producer fetches the missing members into `<record>/deep/` (reusing the
+  saved zip listings, so no listing request is repeated), and the
+  consumer runs the record again with both passes. The triage decision is
+  taken again from the triage-pass images only, so it is the same.
+- Local and downloaded files (archives downloaded whole are downloaded
+  once, on the triage pass): the consumer takes the deep sample at once.
+- The row says which pass the record got: `sampling_pass` (single, triage
+  or deep), `n_triage_classified`, `triage_eye_fraction` and
+  `deep_pass_reason`; `n_remote_reused` counts the deep sample's members
+  taken over from the triage pass.
+- `--triage-cap 0` turns the two passes off (one pass, as before). `run`
+  applies the same rule within its one process.
+
+### Disk safety
+
+- The spool dir must be new, empty or marked by the survey
+  (`.envision_survey_spool`), and it may not be, contain or sit inside the
+  downloads dir or the output dir. Deletions happen only for record dirs
+  directly under `<spool>/records/` named by a record id, never through a
+  symlink. `data/downloads` and earlier results dirs are never written.
+- One spool, one state dir: the fetch and process roles each lock
+  `<spool>/.lock_fetch` and `<spool>/.lock_process` as well as their lock
+  in the state dir, and the spool records the state dir that owns it
+  (`<spool>/.state_dir`). A second run given the same spool with another
+  state dir refuses to start, since the producer deletes half-written
+  record dirs and the consumer deletes finished ones.
+- High-water mark: the producer starts no record while the spool holds
+  more than `--spool-max-gb` (default 300) or while the drive would keep
+  less than `--disk-floor-gb` (default 80) free, counting the bytes the
+  records in flight reserved; it waits (state `waiting_for_room` in its
+  status) until the consumer frees space. A record larger than the spool
+  budget starts once nothing else is spooled or in flight. Deep passes of
+  records already in the spool are held back only by the floor (records
+  waiting for their deep pass could otherwise fill the spool and wait on
+  each other). A new record waiting for room gives its fetch slot to a
+  pending deep or refetch request (event `triage_yielded`; the record goes
+  back to the front of the queue), so a spool full of records awaiting
+  their deep pass is always served and freed. The room check and the
+  reservation are one step, so parallel fetch workers never count the
+  same free space twice.
+- Downloads also stop when the floor is crossed while they stream, and the
+  consumer's own extractions (nested archives, split sets) check the
+  floor minus the producer's published reservations.
+- When the consumer has been gone for `--consumer-grace-s` (default 600)
+  while the producer has to wait for it, the producer stops (exit code 3)
+  instead of waiting for ever; the record it was about to fetch is not
+  written.
+
+### Resuming
+
+Kill any role (or the whole pipeline) and start the same command again:
+
+- A record is done only when its final row is in `survey_results.jsonl`
+  (`started` and `awaiting_deep` lines do not count). At start the
+  producer leaves out done records and records a previous run left
+  `READY`, `AWAITING_DEEP` or `DEEP_READY` in the spool (the consumer and
+  the request files own those, so a record the consumer finishes is never
+  fetched a second time), and it skips a queued record that got a final
+  row since it started. Record dirs without `READY` that a killed or
+  failed fetch job left are deleted at start (event
+  `partial_spool_removed`), whatever the new run's `--ids`, `--limit` or
+  `--retry-status`, and the records still to do are fetched again.
+- Pending deep and refetch requests (`<spool>/requests/`) survive a
+  restart and are served before new records. A record left
+  `AWAITING_DEEP` without a request (a role killed between the two steps)
+  gets its deep request again (event `deep_request_restored`), at start
+  and every 30 s. The producer removes a served request before it
+  publishes the record, so a new request the consumer writes right after
+  is kept, and it ends only after two checks, one poll apart, find no
+  spooled record and no request.
+- The consumer counts its starts of each record (`.attempts` in the
+  record dir). A record it started `--max-attempts` (default 2) times
+  without finishing (the process died inside it) gets status `crashed`
+  (rerun with `--retry-status crashed`).
+- A spooled file that is missing or changed size is not processed: the
+  consumer removes the record's markers (the dir is then half written for
+  the producer) and requests a refetch; the producer deletes the dir and
+  fetches the record again. The consumer marks such a dir `RETURNED`
+  first, so a kill between the two steps leaves a returned dir without a
+  request, whose request the producer restores (event
+  `refetch_request_restored`). After two refetches the record gets
+  an `error` row, written before its dir is deleted.
+- A record whose final row was written after its `READY` (or
+  `DEEP_READY`) marker (the consumer died between the row and deleting
+  the dir) is not classified again: its dir is deleted (event
+  `spool_already_done`).
+- A triage job that gives its slot to a request keeps its archive probe
+  result, so the retry does not probe the same archives again.
+- The consumer registers the token for redaction too (it never sends
+  it), so everything it writes (rows, events, CMDS, predictions, the
+  workbook) is redacted even when a producer's error text carried the
+  token. Spool files are scratch and keep file names as they are (a
+  redacted path could not be validated or read).
+- `--retry-status` works as in `run`: the producer fetches those records
+  again and the consumer replaces their rows.
+
+### Operating guide
+
+From the envision-discovery checkout root, with the 30,501-record scrape
+copied next to the old results (do not overwrite the older scrape):
+
+```bash
+MODEL=/path/outside/repo/regnety004_synthonly_distill_s2.onnx
+OUT=results/survey_pull; STATE=results/survey_pull_state; SPOOL=/big/disk/survey_spool
+mkdir -p $OUT $STATE
+# optional pass 0: record and DataCite JSON for every record (about 2 requests each,
+# resumable; the producer otherwise fetches them record by record)
+envision-survey metadata --scrape results/zenodo_full.json --metadata-cache-dir data/metadata/zenodo_full \
+    --state-dir $STATE
+setsid nohup envision-survey pipeline --model $MODEL --scrape results/zenodo_full.json \
+    --metadata-cache-dir data/metadata/zenodo_full --out-dir $OUT --state-dir $STATE --spool-dir $SPOOL \
+    > $STATE/pipeline.log 2>&1 < /dev/null &
+cat $STATE/status.json                        # or: envision-survey monitor --state-dir $STATE --once ...
+tail -f $STATE/logs/fetch.log $STATE/logs/process.log
+envision-survey excel --model $MODEL --results-dir $OUT --out $OUT/zenodo_modality_survey.xlsx
+```
+
+- The token is read from `~/.config/envision-survey/zenodo_token` (mode
+  600) when that file exists; nothing token related goes on the command
+  line.
+- Stop: `kill -TERM <pipeline pid>` forwards the signal to the roles;
+  killing the roles one by one is safe too. Start the same command again
+  to resume. On Linux the roles also get SIGTERM when the pipeline process
+  itself dies without forwarding it (SIGKILL, an OOM kill): process
+  finishes its current record, then exits, so no role keeps running
+  without a supervisor. A new start refuses while a role of the same
+  state dir is still alive; wait for it to end.
+- The roles can also run on their own (`fetch`, `process`, `monitor` with
+  the same options): one process per role and state dir (a lock in
+  `<state>/locks/`, which also tells the others whether a role is alive).
+  A consumer without a producer drains the spool and stops; a producer
+  without a consumer fetches until the spool is full.
+- `excel` can run at any time; rows still in progress show as `started`
+  or `awaiting_deep`.
+
+Order of work: `--order cost` (default) fetches records with little to
+download first (no pixel files, then remote zips at a nominal 50 MB each,
+then whole-file downloads by size, from the cached record JSON when there
+is one, else from the scrape's file names and size), so the catalogue
+fills early and the large archives come last; `--order scrape` keeps the
+scrape order.
+
+Throughput (measured from the VM): Zenodo allows 133 requests per 60 s
+window per IP and User-Agent whatever the token; the survey keeps to 120.
+A single download stream runs at about 1 to 2 MB/s and 8 streams at about
+17 MB/s together, so four fetch workers with two or three streams each
+fill most of the link. Expect about 30,000 metadata requests, about
+120,000 triage requests and a deep pass for the records with eye images:
+two to three days end to end at 120 requests per minute, with the
+consumer (two cores) rarely the bottleneck.
+
+Files in the state dir:
+
+| File | Written by | Content |
+|---|---|---|
+| `status.json`, `monitor.jsonl` | monitor | the latest snapshot; one line per snapshot |
+| `fetch_status.json`, `process_status.json` | each role, every 15 s | state, counters, current records, heartbeat |
+| `fetch_events.jsonl` | fetch | fetched, fetched_deep, archive_probe, skipped_disk, fetch_job_error, ... |
+| `pipeline_status.json`, `pipeline_events.jsonl` | pipeline | each role's pid, start, end, exit code and restarts; role_crashed, role_restarted, role_given_up |
+| `logs/<role>.log` | pipeline | each role's output |
+| `locks/<role>.lock` | each role | one process per role; liveness |
+| `zenodo_requests`, `zenodo_not_before`, `disk_reserve.*` | fetch (and process) | shared request budget, 429 cooldown, in-flight disk reservations |
+
+Pipeline options (besides the `run` options above, which all roles
+accept):
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--spool-dir` | required | where the producer writes records for the consumer |
+| `--state-dir` | required | status, locks, logs, events, request budget and 429 cooldown |
+| `--spool-max-gb` | 300 | the producer starts no record while the spool holds more |
+| `--fetch-workers` | 4 | records fetched at once |
+| `--triage-cap` | 50 | two-pass sampling (0: one pass) |
+| `--order` | cost | cost or scrape |
+| `--max-attempts` | 2 | consumer starts of a record before it is `crashed` |
+| `--consumer-grace-s` | 600 | the producer stops when the consumer has been gone this long and it has to wait |
+| `--max-role-restarts` | 20 | pipeline: restarts of fetch or process (each) before that role is given up |
+| `--restart-backoff-s` | 10 | pipeline: first restart delay, doubled per restart, at most 300 s |
+| `--poll-s` | 10 | polling interval of the roles |
+| `--interval` | 60 | monitor snapshot interval |
+| `--once`, `--exit-when-idle` | off | monitor: one snapshot; or stop when neither role runs |
 
 ## How a record is processed
 
 1. **Metadata.** The legacy record JSON comes from `--metadata-dir` when it
    is there, otherwise from the Zenodo API. The DataCite JSON comes from
    `GET /api/records/<id>` with `Accept: application/vnd.datacite.datacite+json`.
-   Both are cached under `<out-dir>/cache/`. Every Zenodo request (metadata
+   Both are cached under `<out-dir>/cache/` (or `--metadata-cache-dir`). The
+   legacy JSON lists every file of the record (checked on a record with
+   1778 files); the scrape's `file_names` stops at 20 and its
+   `zip_file_types` is empty, so the survey never plans from the scrape's
+   file lists. Every Zenodo request (metadata
    calls, downloads, zip listings, member fetches and range reads, across
-   all worker threads) goes through one shared throttle: at most 110
+   all worker threads) goes through one shared throttle: at most 120
    requests in any sliding 60 s window (`--rpm`) and at least 0.5 s
    between two requests (`--zenodo-interval`). A 429 sets a shared cooldown
    from Retry-After (seconds or HTTP-date; at least 60 s when the header is
    missing) that every worker waits on, and with `--shared-state-dir` every
    other process sharing that dir as well; with that dir the processes
-   together also stay under `--shared-rpm` (110) per sliding minute. 5xx
+   together also stay under `--shared-rpm` (120) per sliding minute. 5xx
    responses and transport errors
-   back off exponentially per request (2 s doubling up to 120 s).
+   back off exponentially per request (2 s doubling up to 120 s). Zenodo's
+   own `X-RateLimit-Remaining` is read on every response: at 3 or fewer
+   requests left, every request pauses until `X-RateLimit-Reset` (epoch
+   seconds), whatever the local count says.
 2. **Files.** Downloading everything is not an option: Zenodo serves the
    VM at 2 to 7.5 MB/s, so the 1.75 TB of records not yet on disk would take
    3 to 4 days. Each file is handled one of three ways, and the record's
@@ -293,10 +605,21 @@ Main options (`envision-survey run --help` lists all of them):
      endpoint refuses a member, it is read with a range request of its own
      bytes instead. When the container listing itself failed for a zip,
      its members go straight to range reads rather than paying a full
-     retry cycle on the container endpoint per member. A stored or deflated
-     member is read with one streamed range request and inflated on the
-     fly into the scratch file, so memory stays flat for any member size;
-     other compression methods go through `zipfile` in block-sized reads.
+     retry cycle on the container endpoint per member. A member of 16 MB
+     or more that is at least twice as large inflated as compressed is
+     read by range too, since the container endpoint sends it inflated. A
+     stored, deflated or Deflate64 (method 9, through `inflate64`) member
+     is read with one streamed range request and inflated on the fly into
+     the scratch file, so memory stays flat for any member size; other
+     compression methods go through `zipfile` in block-sized reads. A zip
+     over 4 GiB written without ZIP64 records stores 32-bit offsets that
+     wrapped, and `zipfile` then shifts every member offset by a multiple of
+     4 GiB (record 4005629 lost 79 of 280 fetches to this): a member whose
+     local header is not at the listed offset is looked up at the offsets
+     4 GiB apart, accepted only when the signature and file name match. A
+     volume header member (`x.mhd`, `x.hdr`, `x.nhdr`) is fetched together
+     with its data member (`x.raw`, `x.zraw`, `x.img`) into a directory of
+     their own, under their own names.
      A range body that breaks off mid-read or comes back short is retried
      with backoff. A zip whose listing fails both ways counts in
      `remote_listing_failures` (see Statuses). A zip whose images sit in
@@ -315,8 +638,13 @@ Main options (`envision-survey run --help` lists all of them):
      gets a sample of those, sniffed for DICOM. The container API answers
      HTTP 500 for RAR, so it is used for zip only.
 
-     Two byte bounds keep one record from pulling gigabytes. Members over
-     `--remote-max-member-mb` (200 MB) are never sampled: they are left out
+     Two byte bounds keep one record from pulling gigabytes. Members whose
+     transfer is over `--remote-max-member-mb` (200 MB) are never sampled.
+     The transfer is the compressed size (the bytes a range read moves),
+     not the inflated size: a 794 MB confocal stack stored in a 188 MB zip
+     (record 4943680) is sampled, and its decode is bounded separately (a
+     reduced read, see Format conversion; a member may inflate to at most
+     4 GiB on disk). Oversize members are left out
      of the candidates, so the zip's quota goes to its other members
      (`n_members_skipped_oversize` counts them). They are outside the
      sampling frame, so they are left out of the population as well: the
@@ -350,12 +678,22 @@ Main options (`envision-survey run --help` lists all of them):
      `n_remote_over_budget`, `remote_budget_stop` and
      `remote_bytes_fetched_ok` are left out (blank in the workbook).
    - **download**: other missing files that can hold images are streamed
-     whole into `scratch_dir/records/<id>/dl/`: rar, 7z, tar and gz
-     archives and their split parts, images, DICOM, volumes, extensionless
-     files, and single-file `.gz`/`.bz2`/`.xz` files whose inner name is an
-     image or an archive (`x.tif.gz`, but not `x.csv.gz` or `x.h5.gz`).
+     whole into `scratch_dir/records/<id>/dl/`: rar, 7z, tar (zstd
+     included) and gz archives and their split parts, every pixel-bearing
+     kind the survey converts (images, SVG, DICOM, volumes and volume
+     headers with their data file, vendor OCT, video, numeric arrays,
+     microscopy), extensionless files, and single-file
+     `.gz`/`.bz2`/`.xz`/`.zst` files whose inner name is one of those or an
+     archive (`x.tif.gz`, but not `x.csv.gz`).
      Top-level image files beyond `--remote-cap` are sampled (seeded); the
      others are counted and their names used for laterality and hints.
+     Large top-level files of one homogeneous series (same kind, extension
+     and name with digit runs masked, each at least `--series-min-mb`,
+     more than `--series-sample-k` of them) are sampled the same way, 3 per
+     series by default: record 15116835 has 30 land-cover GeoTIFFs of
+     913 MB each, and three say what the others are (the old run fetched
+     16 of them, 14.6 GB, and read none). `n_series_files_not_fetched`
+     counts the rest.
      Each record may download up to `--max-download-gb` (15 GB). When its
      files need more, the budget is filled smallest first (the parts of a
      split archive count as one unit, since a partial set cannot be read),
@@ -374,9 +712,40 @@ Main options (`envision-survey run --help` lists all of them):
      stopped and deleted ("disk floor reached"), since another process may
      have used the space since the first check.
 
-   Documents, code, tables, arrays, genomics files, video and vendor OCT
-   containers are not fetched unless `--download-all` is set, because
-   nothing reads them.
+   Documents, code, tables and genomics files are not fetched unless
+   `--download-all` is set, because nothing reads them.
+
+   **Archive probe.** Before a non-zip archive is downloaded whole, its
+   listing is read with a few HTTP range requests (`probe.py`), and the
+   archive is downloaded only when the listing shows a member the walker
+   would use: a pixel-bearing file, a nested archive or a compressed image,
+   or (in tar) an extensionless member that sniffs as DICOM or an image.
+   An uncompressed `.tar` is listed by hopping from header to header; a
+   compressed tar (`.tar.gz`, `.tgz`, `.tar.bz2`, `.tar.xz`, `.tar.zst`)
+   by streaming its first `--archive-probe-mb` (64 MB) and listing on the
+   fly (a compressed tar has no index, so a listing cut off by that limit
+   without an image member is undecided); `.7z` by reading its end header
+   (encoded headers included); `.rar` (4 and 5) by walking the block
+   headers and stopping at the first member that counts (`rarfile` takes
+   over for layouts the walker does not parse); a single-file `x.gz` by its inner name (an extensionless inner
+   name gets its first bytes decompressed and sniffed). Each probe stops at
+   `--archive-probe-mb` bytes and `--archive-probe-max-requests` (50)
+   requests, and a record at 1 GiB and 400 requests of probing. Outcomes:
+   `images` (downloaded as before), `no_images` (the whole listing was
+   read and holds nothing usable: not downloaded, its member names and
+   kinds are catalogued, and a record with nothing else to read gets
+   status `no_images_in_archives`), `unknown` (limit reached, encrypted
+   header, error: downloaded as before, so an image-bearing archive is
+   never skipped) and `not_probed` (archives of 1 MB or less, split sets:
+   one part never proves a set empty). The row keeps each archive's
+   outcome, method, member counts, bytes and requests (`archive_probes`,
+   the Archive_Probes sheet) and `archive_probe_bytes_avoided`.
+   `--no-archive-probe` turns it off.
+
+   **Split sets.** Numbered and `split`-style sets (`x.tar.001`,
+   `x.zip.partaa`, `x.part01`) are fetched as one unit and joined into one
+   file in the scratch dir before the walk (`split_join_detail`); rar,
+   spanned zip and `x.7z.001` sets are read by their tools as before.
 3. **Enumerate.** Archives are listed, not unpacked:
    - zip is read through its central directory;
    - tar goes through one streaming pass;
@@ -384,12 +753,20 @@ Main options (`envision-survey run --help` lists all of them):
      are extracted with `unrar`, because many 7z builds list RAR but cannot
      decode it.
 
-   Nested archives and single-file `.gz`/`.bz2`/`.xz` members are extracted
+   Nested archives and single-file `.gz`/`.bz2`/`.xz`/`.zst` members are extracted
    one at a time into the scratch dir and walked, up to depth 3. An
    extracted archive with no image members, and a decompressed file that
    is not an image, is deleted right after it is walked, so per-patient
    inner zips cannot fill the disk during listing.
-   Extensionless members are sniffed for the DICOM `DICM` marker.
+   Extensionless members are sniffed by their first bytes: DICOM with the
+   `DICM` preamble or without it (a group 0002 or 0008 element at offset
+   0, as in ACR-NEMA style files), PNG, JPEG, TIFF and BMP. A volume header
+   is paired with its data member from the same directory, and both are
+   extracted together when it is sampled. Local zips get the same 4 GiB
+   offset lookup as remote ones, and Deflate64 members are read through
+   `zipfile-deflate64` (or 7z). `member_ext_counts` counts every archive
+   member listed by extension (local, remote and probed archives), so a
+   record whose zips hold `.mat` or `.nd2` files shows it.
    Password-protected archives never stop the run: `7z` gets a dummy
    `-pnone` password and `unrar` gets `-p-`, with stdin closed, so they fail
    at once instead of waiting for a password prompt. An archive with an
@@ -425,20 +802,98 @@ Main options (`envision-survey run --help` lists all of them):
    and tar members are read directly, and 7z members are extracted to a
    temp dir in batches of at most 400 members and at most min(20 GB, free
    space minus the disk floor); members that do not fit are reported as
-   `skipped (disk floor)`. Each file gives one frame:
-   - raster images give their first frame (the frame count is recorded);
-   - multi-frame DICOM gives its middle frame, read with `pydicom`;
-   - NIfTI, NRRD and MHA give the middle slice along the shortest axis.
-     The uncompressed voxel size is computed from the header first, and
-     volumes over 2 GiB uncompressed are inventoried but not loaded (a small
-     gzip NRRD can expand to many GB). NIfTI is sliced through the nibabel
-     proxy and MHA/NRRD through a SimpleITK extract region, so only the
-     slice is materialised where the format allows it.
+   `skipped (disk floor)`.
 
-   Images over 80 MP are inventoried but not decoded, and so are TIFFs
-   whose decoded page would exceed 1 GiB (the tifffile fallback reads the
-   image length and width, not the shape, so planar RGB pages are sized
-   right). Preprocessing rebuilds the training input exactly. First comes a
+   **Format conversion.** Every pixel-bearing format is turned into one
+   8-bit RGB frame (`images.py`); size never refuses a file, a large one
+   is read at a reduced resolution instead:
+   - TIFF of every kind (BigTIFF, tiled, pyramids, OME-TIFF, ImageJ and
+     LSM stacks, SVS and NDPI slides; 1 to 64 bit, float, planar) goes
+     through `tifffile` (codecs from `imagecodecs`). A pyramid gives its
+     smallest level whose long side is at least 1024 px; a stack of
+     same-shape pages gives its middle Z (or time) plane and first channel,
+     not page 0, which in an OCT B-scan stack is an edge scan and in a
+     confocal stack is often blank (`frame_index`). A page over the pixel
+     budget (80 MP) or the decode budget (1 GiB) is decoded one strip or
+     tile at a time, keeping every s-th row and column (s chosen to land
+     under 16 MP), so memory holds one segment plus the output: the
+     228 MP float32 GeoTIFFs of 15116835 and the 96523 x 153811 BigTIFF of
+     4571628 are read, where the old run refused them (`too_large`).
+   - JPEG is decoded at a reduced DCT scale when large, JPEG 2000 at a
+     reduced resolution level; PNG, BMP, GIF, WebP, PSD (the composite),
+     HEIC and AVIF (`pillow-heif`) go through Pillow.
+   - SVG: the largest embedded raster image (a figure wrapping a photo),
+     else the drawing rendered 512 px wide on white with `resvg`. Every
+     reference that is not an in-document fragment or an embedded data URI
+     is removed first and resources resolve in an empty directory, so
+     rendering reads nothing outside the file and fetches nothing. Memory
+     is bounded: a file over 64 MB is refused before it is read, an `.svgz`
+     is decompressed only up to 64 MB (a gzip bomb never expands whole),
+     and an embedded image over the pixel budget is not decoded (the file
+     is then `too_large` unless a smaller embedded image can be used).
+   - DICOM: the middle frame of a multi-frame file, with the compressed
+     transfer syntaxes common in ophthalmology decoded (JPEG lossless,
+     JPEG-LS and JPEG 2000 through `pylibjpeg`, RLE natively).
+   - NIfTI, NRRD, MHA and header + data pairs (MHD + RAW through
+     SimpleITK, Analyze HDR + IMG through nibabel, detached NRRD): the
+     middle slice along the shortest axis. The uncompressed voxel size is
+     computed from the header first, and volumes over 2 GiB uncompressed
+     are not loaded (a small gzip NRRD can expand to many GB). NIfTI is
+     sliced through the nibabel proxy and MHA/NRRD through a SimpleITK
+     extract region, so only the slice is materialised.
+   - Numeric arrays (`.npy`, `.npz`, HDF5 incl. Imaris `.ims`, MAT v7.3
+     through h5py, MAT v5 through scipy): among the numeric datasets, the
+     image-shaped ones (after dropping size-1 axes and a last axis of 3 or
+     4 channels, a 2D plane, or the middle slice of the shortest of the
+     last three axes, with both sides at least 64 px and an aspect ratio of
+     at most 32, so signals and tables are not images); a name such as
+     image, oct, bscan, vol, fundus or frame wins over a larger plane. Only
+     the chosen slice is read (h5py and memory-mapped NumPy slice lazily,
+     strided when large). Network parameters are never candidates: a
+     dataset named like a layer parameter (kernel, bias, weight, gamma,
+     beta, running_mean, moving_variance, embeddings, with an optional
+     `:0`) is skipped, and an HDF5 that Keras wrote (root attribute
+     keras_version, model_config or training_config, or a group
+     model_weights) is not searched at all. A file without such a dataset
+     (model weights, tables) is reported as `not_image_shaped`, which does not count as a
+     pixel file for the record status.
+   - Microscopy: CZI (`pylibCZIrw`, read at a zoom under the budget), LIF
+     (`readlif`), ND2 (`nd2`, lazily), OIB (`oiffile`), MRC (`mrcfile`,
+     memory-mapped): middle Z plane, first channel, time 0.
+   - Vendor OCT: Heidelberg E2E, Topcon FDS and FDA (checked for the FOCT
+     signature, since `.fds` is also the Fire Dynamics Simulator format)
+     and Bioptigen OCT through `oct-converter`; Heidelberg VOL (HSF-OCT)
+     and Thorlabs OCT (a zip of Header.xml and `data\*.data`) through the
+     survey's own readers. The middle B-scan is classified, and the fundus
+     or SLO image (Thorlabs: the camera image) is classified as a
+     prediction of its own (path ending `#fundus`). A Thorlabs file with
+     only raw spectra gets a B-scan from 1024 A-scans of its middle
+     spectral file (mean spectrum removed, Hann window, FFT, log
+     magnitude; no chirp correction). Heidelberg SDB has no open reader and
+     is catalogued. `oct-converter` imports OpenCV; the survey extra
+     installs the headless build, which needs no libGL.
+   - Video: frames at 25, 50 and 75% of the duration (the ffmpeg bundled
+     with `imageio-ffmpeg`), classified together: their probabilities are
+     averaged into one prediction (`n_frames_averaged`).
+
+   Integer data deeper than 8 bits and floats are windowed between the 0.5
+   and 99.5 percentiles (on at most 1M samples), except data with 256 or
+   fewer distinct values (label maps keep exact levels, min-max); float
+   nodata (below -1e30 or non-finite) is left out of the window. An alpha
+   channel (RGBA, LA, P or L with a transparent color) is composited over
+   white, so a transparent figure no longer turns black. A constant frame
+   is `blank`: it is not classified (`n_blank`). Each prediction line
+   carries the source format and the conversion path, and the row
+   summarises them (`formats_classified`, `conversion_counts`,
+   `formats_unread`). A file that gives no image is written to the
+   predictions file with its reason and header facts (rows, columns,
+   format, compression), and counted in `n_pixel_files_unread_by_reason`
+   (`decode_error`, `codec`, `too_large`, `companion_missing`,
+   `no_reader`, `not_image_shaped`, `wrong_format`, `fetch_failed`,
+   `blank`, `not_fetched`, `not_sampled`, `not_sampled_like_sample`, `oversize_member`,
+   `over_record_budget`, `over_download_budget`, ...).
+
+   Preprocessing rebuilds the training input exactly. First comes a
    content crop (the bounding box of pixels brighter than
    max(12, 0.08 x max gray), skipped if under 2% of pixels are foreground).
    Then the image is squashed to 256 x 256 without keeping its aspect ratio,
@@ -484,7 +939,31 @@ Main options (`envision-survey run --help` lists all of them):
    them, where the exact-count rule caught 128) and none of the 45 color
    fundus photographs in Folder 6.
 
-   A flagged image gets the label MASK instead of its model label, in the
+   Single-channel data deeper than 8 bits is tested on its native values
+   (a 128 x 128 nearest sample, same rule) instead of the 8-bit frame:
+   scaling to 8 bits only merges values, so a few saturated pixels could
+   squeeze a real 12- or 16-bit image into a few gray levels (in a
+   simulation on tier-3 images, 136 of 150 pseudocolor frames were flagged
+   that way; none are on native values, and 200 of 200 synthetic 16-bit
+   masks still are).
+
+   The pixel check also flags flat-colour graphics: in the audit of the 65
+   `mask_dominated` records of the previous run, 460 of 10,189 flagged
+   images were plots, word clouds, map GIFs, logos and flowcharts, and 38
+   records were `mask_dominated` only because of them. The model settles
+   it: a flagged image gets the label MASK only when the model's argmax is
+   an eye class; with argmax NEG it keeps its model label (NEG or
+   UNCERTAIN) and counts as a non-mask image (`n_mask_like_veto`,
+   `mask_like_veto: true` in the predictions file). Validated on the
+   tier-3 set (the 64 known masks stay MASK, no real image flagged), on
+   HRF-Seg+ (213 of 225 masks stay MASK, no photo flagged) and on a replay
+   of all 288 classified records of the previous run (no `ok` record loses
+   an eye class; 35 graphic records move from `mask_dominated` to
+   `no_eye_images`). A flagged graphic whose argmax is an eye class (a pie
+   chart as CFP, a scatter plot as OCTA) stays MASK, which is what keeps a
+   false eye class out.
+
+   A MASK image counts in the
    thresholded counts (`n_MASK`, `frac_MASK`) and in the argmax counts
    (`argmax_MASK`, `argmax_frac_MASK`) alike; the predictions file keeps
    the model's `top` class and its thresholded `model_label` next to
@@ -518,8 +997,15 @@ Main options (`envision-survey run --help` lists all of them):
    `present_eye_classes`, the CMDS structure description gets no modality
    directories, the Record_Classes sheet no rows, and its weblinks are
    catalogued. A record with 50 or more non-mask images follows the
-   normal rule whatever its mask share. Rows from runs before this rule
-   (and the dominance mask test) carry `survey_version` 3.
+   normal rule whatever its mask share, and so does a paired segmentation
+   dataset: when the non-mask images hold at least 10 images of one eye
+   class other than OCTA with a mean top-1 confidence of at least 0.75
+   (`mask_exempt_class`), the record is judged by the normal rule (7678656:
+   28 fundus photos next to 28 vessel masks; HRF-Seg+). OCTA never exempts,
+   because missed masks come out as OCTA. Rows from runs before this rule
+   (and the dominance mask test) carry `survey_version` 3; rows before the
+   format conversion, the mask veto and the status split carry version 5
+   or lower.
 5. **Describe.** Per-image facts are rolled up into DICOM-aligned columns
    (see below). The two CMDS JSON files are written to
    `<out-dir>/cmds/<id>/` and validated against the bundled CMDS v0.1.1
@@ -570,7 +1056,13 @@ Main options (`envision-survey run --help` lists all of them):
 Memory stays small on a 7 GB VM:
 - archive members are read one at a time;
 - members over 256 MB spill to a temp file instead of RAM;
-- large JPEGs are decoded at a reduced DCT scale;
+- large JPEGs are decoded at a reduced DCT scale, large TIFFs strip or
+  tile at a time, large arrays and volumes by strided slices; a TIFF whose
+  one strip or tile is itself over the 1 GiB decode budget (ImageJ and
+  some scanners write the whole plane as one strip) is strided through a
+  memory map when uncompressed and gets `too_large` when compressed;
+- 16-bit and float planes are windowed to 8 bits in one float32 working
+  copy, scaled in place (percentiles from a 1M-sample stride);
 - only compact facts and probabilities are kept per image;
 - remote members and nested archives stream to disk in both fetch paths;
   the range reader keeps at most 64 MB in its block cache and prefetches
@@ -583,14 +1075,19 @@ Memory stays small on a 7 GB VM:
 | `ok` | eye classes make up at least `--min-eye-fraction` (5%) of the non-mask classified images |
 | `no_eye_images` | images were classified, but eye classes are under 5% of the non-mask images (weblinks catalogued) |
 | `mask_dominated` | masks are at least half of the classified images (`frac_MASK` >= 0.5) and fewer than 50 non-mask images are classified (an all-mask record included); eye classes found in the remainder are listed in `review_eye_classes` only, the CMDS structure has no modality directories (weblinks catalogued) |
-| `no_usable_images` | files exist but none decoded into an image (weblinks catalogued) |
+| `no_image_files` | nothing pixel-bearing was listed, or every candidate turned out not to be one (no image-shaped dataset, wrong format; when every sampled file is such a file, the unsampled ones of the record count the same way, `not_sampled_like_sample`); weblinks catalogued |
+| `images_unreadable` | pixel-bearing files were listed but none gave a classified image (decode or codec failure, fetch failure, over a size cap, not fetched or not sampled, blank frames); the reasons are in `n_pixel_files_unread_by_reason`; weblinks catalogued |
+| `no_images_in_archives` | every file to read was a non-zip archive whose probed listing holds nothing usable, so nothing was downloaded (see Archive probe) |
+| `no_usable_images` | runs before survey version 6 only: the two statuses above in one |
 | `no_files` / `restricted` | Zenodo lists no files (weblinks catalogued) |
 | `skipped_disk` | download would breach the disk floor; retry with `--retry-status skipped_disk` |
 | `skipped_size` | none of the record's non-zip files fit `--max-download-gb` and nothing else was readable; file list and weblinks catalogued |
 | `remote_listing_failed` | the record is read only through remote zips and every zip listing failed (429s, 5xx, broken bodies); retry with `--retry-status remote_listing_failed` |
-| `error` | unexpected failure; message and traceback are kept in the JSONL |
-| `crashed` | the process died while this record was running; skipped until `--retry-status crashed` |
+| `error` | unexpected failure; message and traceback are kept in the JSONL (pipeline: also a record whose spooled files failed validation again after two refetches) |
+| `crashed` | the process died while this record was running (pipeline: `--max-attempts` starts without a finish); skipped until `--retry-status crashed` |
 | `started` | only while a run is in progress: the record being processed now |
+| `awaiting_deep` | pipeline only, while in progress: the triage sample holds eye classes and the deep pass is being fetched; replaced by the record's final row |
+| `metadata_unavailable` | the record JSON could not be fetched from Zenodo (retries used up, or the record is gone); weblinks from the scrape catalogued; retry with `--retry-status metadata_unavailable` |
 | `*_partial_download` | suffix added when some files or remote members failed to download, or some remote zip listings failed (`remote_listing_failures`); retry with e.g. `--retry-status ok_partial_download` |
 
 `skipped_disk`, `skipped_size`, `error` and `crashed` records still get a metadata-only
@@ -754,7 +1251,15 @@ CDS v0.1.1, and they are bundled in `survey/resources/schemas/`.
 | Weblinks | catalogued links of records without usable images or without eye images |
 | DICOM_Mapping | reference table of the class to DICOM mapping |
 | Schema_Fields | each AI-READI / CMDS field, its mapping rule and how many records took it from which source (directoryList counts only records with at least one modality directory) |
-| CMDS_JSON | the two CMDS JSON documents of every record, as text, with the full CMDS JSON folder (results dir plus `cmds/<id>`) |
+| Archive_Probes | one row per archive probed before a download: outcome, method, members, images, bytes, requests |
+| CMDS_JSON | the two CMDS JSON documents of every record, as text, with the full CMDS JSON folder (results dir plus `cmds/<id>`); above 2000 records (`--cmds-json auto`, the default) their file paths and sizes instead, so the workbook stays small; `--cmds-json embed` or `paths` forces one form |
+| Formats | classified images by source format, files that gave no image by source format, and classified images by conversion path, each with its record count, over all records |
+
+The workbook is written in openpyxl's write-only mode from an index of the
+results file (byte offsets of each record's winning line), one row in
+memory at a time, so the 30,000-record pull builds in bounded memory. The
+Records sheet carries the discovery SetFit label and p(eye imaging) as
+informational columns, labelled as not used to select records.
 
 ### IR device columns
 
@@ -837,7 +1342,7 @@ compressed non-image downloads, planar TIFFs, DataCite subject codes, the
 link checker's 429 and cache rules, metadata-only CMDS documents, and
 password-protected 7z and zip archives (with the 7z binary installed).
 The full-run hardening added tests, all with a mocked Zenodo HTTP server,
-for: the sliding-window throttle (never more than 110 requests in 60 s, on
+for: the sliding-window throttle (never more than the limit in 60 s, on
 a fake clock) and the 429 cooldown; retries with exponential backoff and
 no retry on 404; container listings, the range-read fallback for truncated
 listings and member fetches by range when the container endpoint refuses;
@@ -902,6 +1407,42 @@ mask-dominated record with a small non-mask remainder (status
 no Record_Classes rows) next to a record with the same mask share and 50
 non-mask images (status `ok`); and the full, results-dir-qualified CMDS
 JSON folder in the workbook. Each new guard was mutation-checked.
+
+`tests/test_pipeline.py` covers the full-pull architecture, offline as
+well (the producer and consumer run in two threads of the test process
+against a mocked Zenodo; the supervisor test starts real child
+processes): the token from the environment, an explicit file or the
+default file, and its redaction from log records (tracebacks included),
+result rows, events, predictions and state files, with the token carried
+as a file name and a title through a whole pipeline run; the triage
+sample as a prefix of the deep sample (also where largest-remainder
+rounding would shrink a zip's share), the deep pass reusing the triage
+members and listings, eye-only deep passes for remote, local and
+top-level images, triage decisions taken on triage-pass images only, and
+no second deep request; the spool guards (overlap with the downloads and
+output dirs, the marker, deletions under `records/` only and never through
+a symlink, size and path validation, the state machine); the disk gate
+(spool budget, floor, deep bypass, stop without a consumer); the
+producer and consumer end to end (deep pass, NEG triage, no pixel files,
+a local original read in place and left untouched, empty spool and no
+requests at the end); the row written before the spool dir is deleted;
+the crash-loop guard, refetch on invalid spool items and the give-up
+after repeated refetches; skipping finished and spooled records and
+redoing partial ones; the stop when the consumer is gone; the monitor's
+counts, ETA, incremental reads and dead-role state; the supervisor
+restarting a crashed role up to its cap, and a consumer killed inside
+one record twice leaving a `crashed` row for it and classifying the
+next; the resume leaving spooled records to the consumer and skipping
+records finished since start; restored deep requests; requests written
+right after publishing surviving; the double end check; the room gate's
+atomic reservation and its yield to requests (a full spool of records
+awaiting their deep pass); single-strip TIFFs over the budget viewed or
+refused, never decoded whole; the in-place windowing memory bound; the
+metadata prefetch and
+its resume; the cost order; the streamed workbook (sheet order, Formats,
+CMDS_JSON as paths or text, the SetFit column label); two downloads with
+one base name; and the pipeline options. Each of these guards was
+mutation-checked.
 
 ## Known limits
 

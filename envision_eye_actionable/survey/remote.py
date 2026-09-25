@@ -28,9 +28,15 @@ fly), the range reader's cache is capped at CACHE_MAX_BYTES, single
 prefetches at PREFETCH_MAX_BYTES, and a range body that breaks off mid-read
 is retried.
 
-Bytes stay bounded per record: members over a per-member cap
+Bytes stay bounded per record: members whose transfer (their compressed
+size, the bytes a range read moves) is over a per-member cap
 (--remote-max-member-mb, default 200 MB) are never sampled, another member
-being drawn in their place, and a per-record byte budget
+being drawn in their place; the uncompressed size is bounded separately
+(UNCOMPRESSED_MAX_BYTES, a disk bound: decoding reads a reduced frame, so a
+well-compressed 800 MB TIFF stack in a 190 MB zip is still sampled). A
+member much smaller compressed than uncompressed is read by range (moving
+the compressed bytes) rather than through the container endpoint (which
+serves it inflated), and a per-record byte budget
 (--remote-record-budget-gb, default 2 GB) covers direct members and nested
 archives together; sampled members past it are not fetched. The budget is
 enforced on the bytes actually received (ByteMeter), failed transfers and
@@ -40,7 +46,7 @@ budget plus one read chunk (1 MB) per fetch worker. Listing requests
 (container listings, central directories) are not counted.
 
 Every request goes through the survey's ZenodoClient: one shared throttle
-(at most 110 requests per minute by default, --rpm) with retries and
+(at most 120 requests per minute by default, --rpm) with retries and
 exponential backoff on 429 and 5xx.
 """
 
@@ -61,7 +67,7 @@ from urllib.parse import quote
 
 import requests
 
-from .constants import IMAGE_KINDS, detect_ext, file_kind, nested_worth
+from .constants import IMAGE_KINDS, detect_ext, file_kind, nested_worth, volume_companion
 from .zenodo import API, RemoteError, ZenodoClient
 
 logger = logging.getLogger(__name__)
@@ -70,6 +76,13 @@ logger = logging.getLogger(__name__)
 # would be inventoried, not decoded, anyway); the survey passes its own,
 # smaller --remote-max-member-mb.
 MAX_MEMBER_BYTES = 1 << 30
+# Uncompressed bytes a fetched member may expand to on disk.
+UNCOMPRESSED_MAX_BYTES = 4 << 30
+# Range reads are preferred over the container endpoint (which sends the
+# member inflated) when a member is at least this large and compresses at
+# least COMPRESSED_PREFER_RATIO to one.
+COMPRESSED_PREFER_BYTES = 16 << 20
+COMPRESSED_PREFER_RATIO = 2.0
 # Nested archives (zip of zips) may be larger; they are streamed to disk in
 # both the container and the range path, never held in memory. Each nested
 # archive is fetched whole, so the per-archive cap and the per-record nested
@@ -111,6 +124,11 @@ class Member:
     crc: int | None = None
     kind: str = "other"
 
+    @property
+    def transfer_size(self) -> int:
+        """Bytes a fetch moves: the compressed size when known."""
+        return self.compressed_size if self.compressed_size > 0 else self.size
+
 
 @dataclass
 class ZipListing:
@@ -141,6 +159,14 @@ class ZipListing:
     @property
     def noext(self) -> list[Member]:
         return [m for m in self.members if m.kind == "noext"]
+
+    def companion(self, m: Member) -> Member | None:
+        """The data member of a volume header member (x.mhd -> x.raw)."""
+        if m.kind != "volume_pair":
+            return None
+        names = [x.name for x in self.members]
+        hit = volume_companion(m.name, names)
+        return next((x for x in self.members if x.name == hit), None) if hit else None
 
 
 # ---------------------------------------------------------------------------
@@ -367,9 +393,16 @@ def allocate(counts: dict[str, int], cap: int) -> dict[str, int]:
     return out
 
 
+def _over(m: Member, max_bytes: int) -> bool:
+    """Too large to sample: the transfer over ``max_bytes``, or the member
+    over UNCOMPRESSED_MAX_BYTES once inflated."""
+    return m.transfer_size > max_bytes or m.size > max(max_bytes, UNCOMPRESSED_MAX_BYTES)
+
+
 def n_oversize(listings: list[ZipListing], pool: str, max_bytes: int) -> int:
-    """Members of ``pool`` that are never sampled for being over ``max_bytes``."""
-    return sum(1 for lst in listings for m in getattr(lst, pool) if m.size > max_bytes)
+    """Members of ``pool`` that are never sampled for being over ``max_bytes``
+    (transfer size, see _over)."""
+    return sum(1 for lst in listings for m in getattr(lst, pool) if m.size > 0 and _over(m, max_bytes))
 
 
 def n_zero_size(listings: list[ZipListing], pool: str) -> int:
@@ -378,24 +411,57 @@ def n_zero_size(listings: list[ZipListing], pool: str) -> int:
 
 
 def sample_members(listings: list[ZipListing], cap: int, rng: random.Random,
-                   pool: str = "images", max_bytes: int = MAX_MEMBER_BYTES) -> list[tuple[ZipListing, Member]]:
+                   pool: str = "images", max_bytes: int = MAX_MEMBER_BYTES,
+                   floor_cap: int | None = None) -> list[tuple[ZipListing, Member]]:
     """Seeded sample of up to ``cap`` members spread over the zips in
     proportion to their candidate counts. ``pool`` is images or noext.
     Members over ``max_bytes`` are not candidates, so another member of the
-    same zip is drawn in their place when the zip has one."""
+    same zip is drawn in their place when the zip has one.
+
+    Prefix-consistent: each zip's candidates are put in one seeded order
+    (it does not depend on ``cap``) and a zip contributes the first members
+    of that order, so the sample drawn with a small cap (the triage pass) is
+    part of the sample drawn with a larger cap from the same seed (the deep
+    pass). ``floor_cap`` (the triage cap, on the deep pass) makes that hold
+    for every zip even where largest-remainder rounding would give a zip one
+    member fewer at the larger cap."""
     groups = {}
     for i, lst in enumerate(listings):
         cands = sorted(getattr(lst, pool), key=lambda m: m.name)
-        cands = [m for m in cands if 0 < m.size <= max_bytes]
+        cands = [m for m in cands if m.size > 0 and not _over(m, max_bytes)]
         if cands:
+            rng.shuffle(cands)
             groups[str(i)] = (lst, cands)
-    quota = allocate({k: len(v[1]) for k, v in groups.items()}, cap)
+    counts = {k: len(v[1]) for k, v in groups.items()}
+    quota = allocate(counts, cap)
+    if floor_cap is not None:
+        low = allocate(counts, floor_cap)
+        quota = {k: max(quota.get(k, 0), low.get(k, 0)) for k in counts}
     out = []
     for k, (lst, cands) in groups.items():
-        n = quota.get(k, 0)
-        picked = cands if n >= len(cands) else rng.sample(cands, n)
-        out += [(lst, m) for m in picked]
+        out += [(lst, m) for m in cands[:quota.get(k, 0)]]
     return out
+
+
+def n_in_frame(listings: list[ZipListing], pool: str, max_bytes: int) -> int:
+    """Members of ``pool`` the sampler may draw (not empty, not over the cap)."""
+    return sum(1 for lst in listings for m in getattr(lst, pool) if m.size > 0 and not _over(m, max_bytes))
+
+
+def listing_to_dict(lst: ZipListing) -> dict:
+    """JSON form of a listing (spool manifests: the deep pass reuses the
+    triage listings instead of listing the zips again)."""
+    return {"key": lst.key, "source": lst.source, "truncated_listing": lst.truncated_listing,
+            "total_reported": lst.total_reported, "error": lst.error, "container_failed": lst.container_failed,
+            "members": [[m.name, m.size, m.compressed_size, m.crc] for m in lst.members]}
+
+
+def listing_from_dict(d: dict) -> ZipListing:
+    lst = ZipListing(key=d["key"], source=d.get("source") or "container",
+                     truncated_listing=bool(d.get("truncated_listing")), total_reported=d.get("total_reported"),
+                     error=d.get("error"), container_failed=bool(d.get("container_failed")))
+    lst.members = [_member(n, s, c, crc) for n, s, c, crc in d.get("members") or []]
+    return lst
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +483,14 @@ def scratch_suffix(name: str) -> str:
     if ext and len(ext) <= 16 and all(ch.isalnum() or ch == "." for ch in ext):
         return ext
     return ""
+
+
+def scratch_suffix_name(name: str) -> str:
+    """A member's base name made safe for a scratch file (volume pairs keep
+    their names so the header finds its data file)."""
+    base = PurePosixPath(name.replace("\\", "/")).name
+    base = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in base)[:200]
+    return base or "member"
 
 
 def safe_member_path(root: Path, zip_index: int, name: str, n: int = 0) -> Path:
@@ -453,6 +527,25 @@ class RangeZips:
             zf.close()
             fp.close()
         self._open.clear()
+
+
+class CountingClient:
+    """A ZenodoClient seen through a counter of the GET calls made through
+    it (``n``; a call's own retries are not counted). Everything else is
+    the wrapped client's."""
+
+    def __init__(self, client):
+        self._client = client
+        self._lock = threading.Lock()
+        self.n = 0
+
+    def get(self, *a, **k):
+        with self._lock:
+            self.n += 1
+        return self._client.get(*a, **k)
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
 
 
 class BudgetExceededError(RemoteError):
@@ -504,22 +597,28 @@ def fetch_member(client: ZenodoClient, record_id: str, lst: ZipListing, m: Membe
 
     ``meter`` counts every byte received (both paths, failed attempts
     included); BudgetExceededError from it propagates to the caller."""
-    if m.size and m.size > max_bytes:
-        return False, f"member of {m.size} bytes is over the fetch cap of {max_bytes}"
+    if m.size and _over(m, max_bytes):
+        return False, (f"member of {m.transfer_size} bytes to transfer ({m.size} inflated) is over the "
+                       f"fetch cap of {max_bytes}")
+    out_cap = max(max_bytes, UNCOMPRESSED_MAX_BYTES)
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:          # a scratch path problem fails this member only
         return False, f"scratch dir: {type(e).__name__}: {e}"[:300]
     tmp = dest.with_name(dest.name + ".part")
     can_range = bool(zip_size) and range_zips is not None
+    compressible = (m.compressed_size > 0 and m.size >= COMPRESSED_PREFER_BYTES
+                    and m.size >= COMPRESSED_PREFER_RATIO * m.compressed_size)
     if lst.container_failed and can_range:
         err = "container: skipped (container API failed for this zip)"
+    elif compressible and can_range:
+        err = "container: skipped (range read moves the compressed bytes)"
     else:
         try:
             url = f"{container_url(record_id, lst.key)}/{quote(m.name, safe='/')}"
             r = client.get(url, stream=True, max_tries=4)
             try:
-                n, crc = _stream_to(tmp, _metered(r.iter_content(chunk_size=1 << 20), meter), max_bytes)
+                n, crc = _stream_to(tmp, _metered(r.iter_content(chunk_size=1 << 20), meter), out_cap)
             finally:
                 r.close()
             _check(n, crc, m.size, m.crc)
@@ -534,7 +633,8 @@ def fetch_member(client: ZenodoClient, record_id: str, lst: ZipListing, m: Membe
     if not can_range:
         return False, err
     try:
-        _range_member(client, record_id, lst, m, tmp, zip_size, range_zips, max_bytes, meter=meter)
+        _range_member(client, record_id, lst, m, tmp, zip_size, range_zips, out_cap, meter=meter,
+                      max_transfer=max_bytes)
         tmp.replace(dest)
         return True, None
     except BudgetExceededError:
@@ -581,40 +681,87 @@ def _check(n: int, crc: int, size: int, want_crc: int | None):
         raise RemoteError("crc mismatch")
 
 
+class _Inflate64:
+    """zlib-like decompressor object over inflate64 (Deflate64, zip method
+    9) for _stream_to. Fed small chunks, so one call stays bounded."""
+
+    unconsumed_tail = b""
+
+    def __init__(self):
+        import inflate64
+        self._d = inflate64.Inflater()
+
+    def decompress(self, data: bytes, max_length: int = 0) -> bytes:
+        return self._d.inflate(data)
+
+    def flush(self) -> bytes:
+        return b""
+
+
+def _locate_local_header(fp: HttpRangeFile, info, zip_size: int) -> tuple[int, bytes]:
+    """Offset and first 30 bytes of the member's local header: at
+    info.header_offset, else at offsets 4 GiB apart (zips over 4 GiB
+    written without ZIP64 records, archives.wrapped_offsets)."""
+    from .archives import local_header_matches, wrapped_offsets
+    n = 30 + len(info.orig_filename.encode("utf-8", "replace")) + 8
+    fp.seek(info.header_offset)
+    head = fp.read(min(n, max(0, zip_size - info.header_offset)))
+    if local_header_matches(head, info) or (len(head) >= 30 and head[:4] == b"PK\x03\x04"
+                                            and not info.orig_filename):
+        return info.header_offset, head[:30]
+    for cand in wrapped_offsets(info.header_offset, zip_size):
+        fp.seek(cand)
+        head = fp.read(min(n, zip_size - cand))
+        if local_header_matches(head, info):
+            return cand, head[:30]
+    raise RemoteError("bad local file header (also at 4 GiB-shifted offsets)")
+
+
 def _range_member(client: ZenodoClient, record_id: str, lst: ZipListing, m: Member, tmp: Path,
                   zip_size: int, range_zips: RangeZips, max_bytes: int, max_tries: int = 3,
-                  meter: ByteMeter | None = None):
+                  meter: ByteMeter | None = None, max_transfer: int | None = None):
     """Read one member with range requests, into ``tmp``.
 
-    Stored and deflated members (nearly all zips) are streamed: the local
-    header is read through the shared ZipFile, then the member's compressed
-    bytes come in one streamed range request and are inflated on the fly, so
-    memory stays flat for any member size. Other methods (bzip2, lzma,
-    deflate64) go through ``zipfile`` with block-sized reads."""
+    Stored, deflated and Deflate64 members (nearly all zips) are streamed:
+    the local header is located through the shared ZipFile (at a 4 GiB
+    shifted offset when the zip wrapped its 32-bit offsets), then the
+    member's compressed bytes come in one streamed range request and are
+    inflated on the fly, so memory stays flat for any member size. Other
+    methods (bzip2, lzma) go through ``zipfile`` with block-sized reads.
+    ``max_bytes`` bounds the inflated output, ``max_transfer`` (default
+    ``max_bytes``) the compressed bytes."""
+    max_transfer = max_bytes if max_transfer is None else max_transfer
     with range_zips.lock:
         fp, zf = range_zips.get(lst.key, zip_size)
         info = zf.getinfo(m.name)
         if info.flag_bits & 0x1:
             raise RemoteError("encrypted member")
-        if info.file_size > max_bytes:
+        if info.file_size > max_bytes or info.compress_size > max_transfer:
             raise RemoteError("member larger than the fetch cap")
-        if info.compress_type not in (0, 8):
+        offset, head = _locate_local_header(fp, info, zip_size)
+        if info.compress_type not in (0, 8, 9):
             if meter is not None:     # counted up front: these reads bypass the streamed path
                 meter.add(30 + len(info.filename.encode("utf-8")) + 1024 + info.compress_size)
-            fp.prefetch(info.header_offset, 30 + len(info.filename.encode("utf-8")) + 1024 + info.compress_size)
-            with zf.open(info) as src, open(tmp, "wb") as out:
+            fixed = info
+            if offset != info.header_offset:
+                import copy
+                fixed = copy.copy(info)
+                fixed.header_offset = offset
+            fp.prefetch(offset, 30 + len(info.filename.encode("utf-8")) + 1024 + info.compress_size)
+            with zf.open(fixed) as src, open(tmp, "wb") as out:
                 shutil.copyfileobj(src, out, 1 << 20)
             return
-        fp.seek(info.header_offset)
-        head = fp.read(30)
     if len(head) != 30 or head[:4] != b"PK\x03\x04":
         raise RemoteError("bad local file header")
     name_len, extra_len = struct.unpack("<HH", head[26:30])
-    start = info.header_offset + 30 + name_len + extra_len
+    start = offset + 30 + name_len + extra_len
     end = start + info.compress_size                       # exclusive
     if end > zip_size:
         raise RemoteError("member data runs past the end of the zip")
     url = file_url(record_id, lst.key)
+    # Deflate64 output per call is not bounded by a max_length: feed it
+    # small chunks (a 64 KB chunk inflates to at most about 66 MB).
+    chunk = (64 << 10) if info.compress_type == 9 else (1 << 20)
     delay = 2.0
     for attempt in range(max_tries):
         try:
@@ -626,8 +773,13 @@ def _range_member(client: ZenodoClient, record_id: str, lst: ZipListing, m: Memb
                     if r.status_code != 206:
                         raise RemoteError(f"server ignored the Range header (HTTP {r.status_code})",
                                           r.status_code)
-                    dec = zlib.decompressobj(-15) if info.compress_type == 8 else None
-                    n, crc = _stream_to(tmp, _metered(r.iter_content(chunk_size=1 << 20), meter),
+                    if info.compress_type == 8:
+                        dec = zlib.decompressobj(-15)
+                    elif info.compress_type == 9:
+                        dec = _Inflate64()
+                    else:
+                        dec = None
+                    n, crc = _stream_to(tmp, _metered(r.iter_content(chunk_size=chunk), meter),
                                         max_bytes, dec)
                 finally:
                     r.close()
@@ -664,15 +816,21 @@ class RemoteSample:
     unfetched_image_paths: list[str] = field(default_factory=list)      # displays, for laterality
     other_member_names: list[str] = field(default_factory=list)
     member_kind_counts: dict = field(default_factory=dict)              # kinds of members not fetched
+    member_ext_counts: dict = field(default_factory=dict)               # every listed member, by extension
     unfetched_image_ext_counts: dict = field(default_factory=dict)
     n_requests: int = 0
-    nested_done: set = field(default_factory=set)                       # (listing index, member name)
+    nested_done: set = field(default_factory=set)                       # (zip key, member name)
     n_members_skipped_oversize: int = 0              # pool members over the per-member cap, never sampled
     n_members_zero_size: int = 0                     # pool members listed with size 0, never sampled
     n_members_over_budget: int = 0                   # sampled members dropped: record byte budget reached
     members_bytes: int = 0                           # listed bytes of the direct members fetched
     budget_stop: str = ""                            # why direct member fetching stopped early, if it did
     bytes_received: int = 0                          # member and nested bytes received, failures included
+    n_pool_in_frame: int = 0                         # pool members the sampler may draw
+    n_reused: int = 0                                # sampled members fetched by an earlier pass, not fetched again
+    n_listing_requests: int = 0                      # requests spent on listings (0 with preloaded listings)
+    nested_more: bool = False                        # nested fetching stopped at the image cap with archives left
+    more_available: bool = False                     # a larger cap (deep pass) would fetch more images
 
     @property
     def bytes_fetched(self) -> int:
@@ -704,7 +862,8 @@ def sample_remote_zips(
     workers: int = 3, nested_max: int = 20, nested_budget_bytes: int = 2_000_000_000,
     room_for=None, on_nested=None, nested_max_bytes: int = NESTED_MAX_BYTES,
     nested_empty_streak: int = NESTED_EMPTY_STREAK, max_member_bytes: int = MAX_MEMBER_BYTES,
-    record_budget_bytes: int | None = None,
+    record_budget_bytes: int | None = None, listings: list[ZipListing] | None = None,
+    floor_cap: int | None = None, skip_members: set | None = None, before: dict | None = None,
 ) -> RemoteSample:
     """List every zip, sample up to ``cap`` image members over all of them
     (proportional to their image counts, seeded) and fetch only those into
@@ -731,32 +890,66 @@ def sample_remote_zips(
     Archives over ``nested_max_bytes`` are never fetched. Records whose zips
     hold only extensionless files (often DICOM) get a sample of those,
     sniffed later. ``room_for(nbytes)`` guards the disk.
+
+    Two passes (triage, then deep) share one seed: ``rng`` gives one draw
+    that seeds a separate generator for the nested order, the member order
+    and the budget order, so none of them depends on ``cap`` and the triage
+    sample is part of the deep one (see sample_members). The deep pass
+    passes the triage ``listings`` (no listing requests), ``floor_cap`` (the
+    triage cap), ``skip_members`` ({(zip key, member name)} fetched by the
+    triage pass: sampled, not fetched again, ``n_reused``) and ``before``
+    (the triage totals nested_images, n_nested_fetched, nested_bytes,
+    bytes_received and the nested archives done, ``nested_done`` as
+    [zip key, name] pairs), so the caps and budgets cover both passes. The
+    counters of the result cover this pass only.
     """
     from concurrent.futures import ThreadPoolExecutor
 
     out = RemoteSample()
+    before = before or {}
+    skip_members = skip_members or set()
+    base = rng.getrandbits(64)
+    rng_nested, rng_members, rng_budget = (random.Random(f"{base}:{p}") for p in ("nested", "members", "budget"))
     meter = ByteMeter(record_budget_bytes)
-    start_requests = client.n_requests
+    meter.n = int(before.get("bytes_received") or 0)
+    # Count this record's own requests: the client is shared by the
+    # producer's concurrent records, so its global counter is not.
+    client = CountingClient(client)
     sizes = {z["key"]: int(z.get("size") or 0) for z in zips}
-    for z in zips:
-        out.listings.append(list_zip(client, record_id, z["key"], sizes[z["key"]]))
+    if listings is not None:
+        out.listings = list(listings)
+    else:
+        for z in zips:
+            out.listings.append(list_zip(client, record_id, z["key"], sizes[z["key"]]))
+    out.n_listing_requests = client.n
+    done_before = {tuple(x) for x in before.get("nested_done") or []}
+    nested_images_before = int(before.get("nested_images") or 0)
+    nested_fetched_before = int(before.get("n_nested_fetched") or 0)
     out.n_images_listed = sum(len(lst.images) for lst in out.listings)
     out.n_noext_listed = sum(len(lst.noext) for lst in out.listings)
     out.n_nested_listed = sum(len(lst.nested) for lst in out.listings)
+    for lst in out.listings:
+        for m in lst.members:
+            e = detect_ext(m.name) or "(none)"
+            out.member_ext_counts[e] = out.member_ext_counts.get(e, 0) + 1
     range_zips = RangeZips(client, record_id)
     try:
         # ---- nested archives (zip of zips) when direct images are scarce
+        out.nested_done |= done_before
         if out.n_nested_listed and out.n_images_listed < cap and on_nested is not None:
             nested = [(i, lst, m) for i, lst in enumerate(out.listings) for m in lst.nested]
             nested.sort(key=lambda t: (t[1].key, t[2].name))
-            rng.shuffle(nested)
-            budget = nested_budget_bytes
+            rng_nested.shuffle(nested)
+            budget = nested_budget_bytes - int(before.get("nested_bytes") or 0)
             empty = 0
             for k, (i, lst, m) in enumerate(nested):
-                if out.n_nested_fetched >= nested_max:
+                if (lst.key, m.name) in done_before:
+                    continue
+                if nested_fetched_before + out.n_nested_fetched >= nested_max:
                     out.nested_stop = f"--remote-nested-max {nested_max} archives opened"
                     break
-                if out.nested_images >= cap:
+                if nested_images_before + out.nested_images >= cap:
+                    out.nested_more = True           # a larger cap would open more of them
                     break
                 if nested_empty_streak and empty >= nested_empty_streak:
                     out.nested_stop = f"{empty} nested archives in a row held no image"
@@ -788,7 +981,7 @@ def sample_remote_zips(
                 budget -= m.size
                 out.nested_bytes += m.size
                 out.n_nested_fetched += 1
-                out.nested_done.add((i, m.name))
+                out.nested_done.add((lst.key, m.name))
                 added = int(on_nested(dest, f"{lst.key}!/{m.name}") or 0)
                 out.nested_images += added
                 empty = 0 if added else empty + 1
@@ -801,16 +994,25 @@ def sample_remote_zips(
         if out.pool:
             out.n_members_skipped_oversize = n_oversize(out.listings, out.pool, max_member_bytes)
             out.n_members_zero_size = n_zero_size(out.listings, out.pool)
-            out.sampled = sample_members(out.listings, cap, rng, out.pool, max_bytes=max_member_bytes)
+            out.n_pool_in_frame = n_in_frame(out.listings, out.pool, max_member_bytes)
+            out.sampled = sample_members(out.listings, cap, rng_members, out.pool, max_bytes=max_member_bytes,
+                                         floor_cap=floor_cap)
+        n_drawn = len(out.sampled)
         if record_budget_bytes is not None and out.sampled:
             # Seeded random order, so a budget cut keeps a random subsample
             # rather than the first zips; fetch order stays as sampled.
+            # Members an earlier pass fetched are kept: their bytes are in
+            # the meter already.
             left = record_budget_bytes - meter.n          # measured: failed nested fetches count too
             order = list(range(len(out.sampled)))
-            rng.shuffle(order)
-            keep: set[int] = set()
+            rng_budget.shuffle(order)
+            keep: set[int] = {j for j, (lst_j, m_j) in enumerate(out.sampled) if (lst_j.key, m_j.name) in skip_members}
             for j in order:
-                size = out.sampled[j][1].size
+                if j in keep:
+                    continue
+                lst_j, m_j = out.sampled[j]
+                comp = lst_j.companion(m_j)
+                size = m_j.transfer_size + (comp.transfer_size if comp is not None else 0)
                 if size > left:
                     out.budget_stop = (f"record byte budget reached after {len(keep)} of "
                                        f"{len(out.sampled)} sampled members")
@@ -819,11 +1021,13 @@ def sample_remote_zips(
                 left -= size
             out.n_members_over_budget = len(out.sampled) - len(keep)
             out.sampled = [item for j, item in enumerate(out.sampled) if j in keep]
+        out.more_available = bool((out.n_pool_in_frame > n_drawn and not out.budget_stop) or out.nested_more)
         picked = {(id(lst), m.name) for lst, m in out.sampled}
+        picked |= {(id(lst), c.name) for lst, m in out.sampled if (c := lst.companion(m)) is not None}
         index = {id(lst): i for i, lst in enumerate(out.listings)}
         for i, lst in enumerate(out.listings):
             for m in lst.members:
-                if (id(lst), m.name) in picked or (i, m.name) in out.nested_done:
+                if (id(lst), m.name) in picked or (lst.key, m.name) in out.nested_done:
                     continue
                 disp = f"{lst.key}!/{m.name}"
                 out.member_kind_counts[m.kind] = out.member_kind_counts.get(m.kind, 0) + 1
@@ -836,16 +1040,32 @@ def sample_remote_zips(
                     out.other_member_names.append(disp)
 
         over_budget = object()      # marker: member not fetched, record byte budget reached
+        reused = object()           # marker: fetched by an earlier pass
 
         def one(numbered):
             n, item = numbered
             lst, m = item
-            dest = safe_member_path(root / "members", index[id(lst)], m.name, n)
+            if (lst.key, m.name) in skip_members:
+                return item, None, reused
+            comp = lst.companion(m)
+            if comp is not None:
+                # A volume header and its data file keep their own names in
+                # a directory of their own (the header refers to the file).
+                pair_dir = root / "pairs" / f"{index[id(lst)]}_{n:05d}"
+                dest = pair_dir / (scratch_suffix_name(m.name))
+            else:
+                dest = safe_member_path(root / "members", index[id(lst)], m.name, n)
             try:
-                if not meter.fits(m.size):
+                need = m.transfer_size + (comp.transfer_size if comp is not None else 0)
+                if not meter.fits(need):
                     return item, dest, over_budget
-                if room_for is not None and not room_for(m.size):
+                if room_for is not None and not room_for(m.size + (comp.size if comp is not None else 0)):
                     return item, dest, "skipped (disk floor)"
+                if comp is not None:
+                    ok, err = fetch_member(client, record_id, lst, comp, pair_dir / scratch_suffix_name(comp.name),
+                                           sizes[lst.key], range_zips, max_bytes=max_member_bytes, meter=meter)
+                    if not ok:
+                        return item, dest, f"volume data member {comp.name}: {err}"
                 ok, err = fetch_member(client, record_id, lst, m, dest, sizes[lst.key], range_zips,
                                        max_bytes=max_member_bytes, meter=meter)
             except BudgetExceededError:
@@ -856,7 +1076,9 @@ def sample_remote_zips(
 
         with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
             for (lst, m), dest, err in ex.map(one, enumerate(out.sampled)):
-                if err is over_budget:
+                if err is reused:
+                    out.n_reused += 1
+                elif err is over_budget:
                     # Failed transfers or retries used the budget up: listed,
                     # unfetched, like the members cut before the fetches.
                     out.n_members_over_budget += 1
@@ -874,6 +1096,6 @@ def sample_remote_zips(
                     out.members_bytes += m.size
     finally:
         range_zips.close()
-        out.n_requests = client.n_requests - start_requests
-        out.bytes_received = meter.n
+        out.n_requests = client.n
+        out.bytes_received = meter.n - int(before.get("bytes_received") or 0)   # this pass
     return out
