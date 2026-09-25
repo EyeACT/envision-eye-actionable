@@ -12,10 +12,15 @@ without it, and deletes only under ``records/``)::
     records/<id>/manifest_deep.json and DEEP_READY
     records/<id>/.attempts        consumer attempts (crash loop guard)
     records/<id>/RETURNED         the consumer sent the record back (refetch)
+    records/<id>/KEEP_FAILED      the record's row says kept but its files could
+                                  not be moved to the keep dir: left in place
     requests/<id>.json            {"kind": "deep" | "refetch"} for the producer
 
 States (``Spool.state``): absent, fetching (dir without READY: the producer
-is writing it, or died writing it), ready, awaiting_deep, deep_ready.
+is writing it, or died writing it), ready, awaiting_deep, deep_ready,
+keep_failed (finished, its row says kept, but moving its files into the keep
+dir failed or no keep dir was configured: neither role touches it, nothing
+deletes it; the next process role with ``--keep-dir`` retries the move).
 
 Ownership: the producer creates and fills a record dir and writes the
 markers; the consumer reads ready dirs and removes a record dir only after
@@ -41,12 +46,13 @@ READY = "READY"
 AWAITING_DEEP = "AWAITING_DEEP"
 DEEP_READY = "DEEP_READY"
 RETURNED = "RETURNED"
+KEEP_FAILED = "KEEP_FAILED"
 MANIFEST = "manifest.json"
 MANIFEST_DEEP = "manifest_deep.json"
 LISTINGS = "listings.json"
 ATTEMPTS = ".attempts"
 DEEP_DIR = "deep"
-STATES = ("absent", "fetching", "ready", "awaiting_deep", "deep_ready")
+STATES = ("absent", "fetching", "ready", "awaiting_deep", "deep_ready", "keep_failed")
 
 
 def _fsync_write(path: Path, text: str):
@@ -106,6 +112,8 @@ class Spool:
         d = self.record_dir(rid)
         if not d.is_dir():
             return "absent"
+        if (d / KEEP_FAILED).exists():
+            return "keep_failed"
         if (d / DEEP_READY).exists():
             return "deep_ready"
         if (d / AWAITING_DEEP).exists():
@@ -170,6 +178,23 @@ class Spool:
         _fsync_write(d / RETURNED, "sent back to the producer\n")
         for name in (READY, AWAITING_DEEP, DEEP_READY):
             (d / name).unlink(missing_ok=True)
+
+    def mark_keep_failed(self, rid: str, reason: str):
+        """Park a finished record whose files must be kept but could not be
+        moved: its dir stays, with its markers, until a process role with a
+        working keep dir finishes the move."""
+        _fsync_write(self.record_dir(rid) / KEEP_FAILED, reason.rstrip("\n") + "\n")
+
+    def clear_keep_failed(self) -> list[str]:
+        """Unpark every keep_failed record (its READY or DEEP_READY marker is
+        still there, so it is ready again). Returns their ids."""
+        out = []
+        for rid in self.record_ids():
+            p = self.record_dir(rid) / KEEP_FAILED
+            if p.exists():
+                p.unlink(missing_ok=True)
+                out.append(rid)
+        return out
 
     def returned(self, rid: str) -> bool:
         return (self.record_dir(rid) / RETURNED).exists()

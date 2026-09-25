@@ -461,6 +461,15 @@ Kill any role (or the whole pipeline) and start the same command again:
   redacted path could not be validated or read).
 - `--retry-status` works as in `run`: the producer fetches those records
   again and the consumer replaces their rows.
+- Adding records to a running survey (for example a gap-fill scrape):
+  write one scrape file that holds the old records and the new ones (no
+  id twice), stop the pipeline, point `--scrape` at the new file and start
+  it again with the same out, state and spool dirs. Finished records are
+  skipped, so only the new ones and the unfinished ones are fetched. They
+  share the one producer and its Zenodo rate limit, and their rows go into
+  the same results file and workbook. A second pipeline on the same
+  machine would compete for the same cores and needs its own out, state,
+  spool and scratch dirs, so a single combined scrape is simpler.
 
 ### Keeping eye-positive records (`--keep-dir`)
 
@@ -489,7 +498,8 @@ first 20, `kept_local_paths`).
 Moves are renames, one per file, never copies: the keep dir must be on the
 spool's filesystem (checked at start) and, like the spool, new, empty or
 marked by the survey (`.envision_survey_keep`), not inside or around the
-spool, downloads or output dir. The survey never deletes anything in it.
+spool, downloads, output, scratch or state dir. The survey never deletes
+anything in it.
 Order: the row (with `kept` true) is written and fsynced, each file is
 renamed, `KEPT.json` is written, the spool dir is deleted. A kill anywhere
 in between leaves the spool dir with its `READY` marker; on restart the
@@ -498,6 +508,16 @@ is left and writes `KEPT.json` again, without classifying the record a
 second time. A file is at every moment in the spool or in the keep dir,
 never in both, and a second move onto the same path replaces it, so
 nothing is lost or duplicated.
+
+A move that fails (an OS error) is tried again after 2 s and 4 s. After a
+third failure the record is parked: its spool dir gets a `KEEP_FAILED`
+marker (spool state `keep_failed`, shown in the monitor's spool counts,
+event `keep_move_gave_up`) and stays with every file that did not move.
+Neither role touches a parked record and nothing deletes it; the next
+process role started with `--keep-dir` removes the markers and finishes
+the moves. A spool dir is deleted only after its move is complete. A
+consumer started without `--keep-dir` parks (never deletes) a record whose
+row says `kept` while some of its files are still in the spool.
 
 Guards. Kept files are never freed, so keeping is bounded: `--keep-max-gb`
 (default 200; 0 for no cap) caps the keep dir, and a record is kept only

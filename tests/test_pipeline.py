@@ -1709,6 +1709,104 @@ def test_keep_move_survives_a_kill_without_losing_or_duplicating_files(tmp_path,
     assert json.loads((kroot / "3102" / "KEPT.json").read_text())["files"] == 4
 
 
+def _release_processor(proc):
+    """What a process role exit frees: its role lock and the survey's out and
+    scratch dir locks (a restart in the same test process)."""
+    proc.lock.close()
+    for fp in getattr(proc.survey, "_locks", None) or []:
+        if fp is not None:
+            fp.close()
+    disk = getattr(proc.survey, "disk", None)
+    if disk is not None:
+        disk.close()
+
+
+def test_keep_move_failures_park_the_record_and_never_delete_its_files(tmp_path, monkeypatch):
+    """A move that keeps failing: backoff between tries, then the record is
+    parked (keep_failed) with its unmoved files; the files that did move are
+    counted; the next consumer start finishes the move."""
+    from envision_eye_actionable.survey import keep, pipeline, runner
+    from envision_eye_actionable.survey.results import load_results
+    monkeypatch.setattr(runner, "OnnxClassifier", _OnnxStub)
+    meta = _write_records(tmp_path, {"3151": {"0.png": b"x"}, "3152": {"0.png": b"x"}})
+    cfg = _cfg(tmp_path, meta, keep_dir=tmp_path / "keep", spool_max_gb=0.001)
+    proc = pipeline.Processor(cfg)
+    s = proc.spool
+    kroot = (tmp_path / "keep").resolve()
+    files = _eye_spool_record(s, "3151")
+    real = keep._rename
+    calls = {"n": 0}
+
+    def eio_after_one(a, b):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real(a, b)
+        raise OSError(5, "Input/output error")
+
+    sleeps = []
+    monkeypatch.setattr(pipeline.time, "sleep", lambda t: sleeps.append(t))
+    monkeypatch.setattr(keep, "_rename", eio_after_one)
+    assert proc.process_one("3151") == "row"
+    row = load_results(cfg.out_dir / "survey_results.jsonl")["3151"]
+    assert row["kept"] is True
+    n_lines = len((cfg.out_dir / "survey_results.jsonl").read_text().splitlines())
+    assert s.state("3151") == "ready"
+    assert proc.process_one("3151") == "keep_move_retry"
+    assert proc.process_one("3151") == "keep_move_retry"            # third failure: parked
+    assert sleeps == [2.0, 4.0]
+    assert s.state("3151") == "keep_failed" and "3151" not in s.ready_records()
+    assert proc.process_one("3151") == "skipped"
+    in_keep = {k for k in _keep_files(kroot / "3151") if k.startswith("dl/")}
+    in_spool = {k for k in _keep_files(s.record_dir("3151")) if k in files}
+    assert len(in_keep) == 1 and in_keep | in_spool == files and not in_keep & in_spool   # nothing deleted
+    moved = (kroot / "3151" / next(iter(in_keep))).stat().st_size
+    assert proc.keeper.per_record["3151"] == moved and proc.keeper.total_bytes == moved
+    assert json.loads((cfg.state_dir / "keep_status.json").read_text())["bytes"] == moved
+    ev = [json.loads(x) for x in (cfg.out_dir / "survey_events.jsonl").read_text().splitlines()]
+    assert [e["event"] for e in ev].count("keep_move_failed") == 3
+    assert [e for e in ev if e["event"] == "keep_move_gave_up"][0]["files_left_in_spool"] == len(in_spool) + 1
+    # the producer never refetches or deletes a parked record
+    prod = pipeline.Producer.__new__(pipeline.Producer)
+    prod.spool = s
+    assert prod._triage({"source_id": "3151"}) == "skipped_keep_failed"
+    # the next consumer start (rename works again) finishes the move
+    monkeypatch.setattr(keep, "_rename", real)
+    _release_processor(proc)
+    proc2 = pipeline.Processor(cfg)
+    assert s.state("3151") == "ready"
+    assert proc2.process_one("3151") == "already_done"
+    assert {k for k in _keep_files(kroot / "3151") if k.startswith("dl/")} == files
+    assert json.loads((kroot / "3151" / "KEPT.json").read_text())["files"] == 4
+    assert s.state("3151") == "absent"
+    assert len((cfg.out_dir / "survey_results.jsonl").read_text().splitlines()) == n_lines
+    # a consumer without --keep-dir parks a record whose move a kill cut short
+    files2 = _eye_spool_record(s, "3152", extra=False)
+    calls["n"] = 0
+
+    def killed_after_one(a, b):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise KeyboardInterrupt("killed mid-move")
+        return real(a, b)
+
+    monkeypatch.setattr(keep, "_rename", killed_after_one)
+    with pytest.raises(KeyboardInterrupt):
+        proc2.process_one("3152")
+    monkeypatch.setattr(keep, "_rename", real)
+    _release_processor(proc2)
+    cfg.keep_dir = None
+    proc3 = pipeline.Processor(cfg)
+    assert proc3.keeper is None
+    assert proc3.process_one("3152") == "keep_parked" and s.state("3152") == "keep_failed"
+    assert {k for k in _keep_files(s.record_dir("3152")) if k in files2} | {
+        k for k in _keep_files(kroot / "3152") if k.startswith("dl/")} == files2
+    _release_processor(proc3)
+    cfg.keep_dir = tmp_path / "keep"
+    proc4 = pipeline.Processor(cfg)
+    assert proc4.process_one("3152") == "already_done" and s.state("3152") == "absent"
+    assert {k for k in _keep_files(kroot / "3152") if k.startswith("dl/")} == files2
+
+
 def test_keep_guards_refuse_without_deleting_kept_records(tmp_path, monkeypatch):
     from envision_eye_actionable.survey import keep, pipeline, runner
     from envision_eye_actionable.survey.results import load_results
@@ -1753,6 +1851,22 @@ def test_keep_dir_must_be_its_own_and_on_the_spool_filesystem(tmp_path, monkeypa
     for bad in (tmp_path / "spool" / "k", tmp_path / "dl" / "k", tmp_path / "out", tmp_path):
         with pytest.raises(ValueError, match="overlaps"):
             keep.Keeper(bad, spool, tmp_path / "dl", tmp_path / "out")
+    # the scratch dir (whose records/ the survey sweeps of all-digit dirs)
+    # and the state dir
+    for bad in (tmp_path / "scratch" / "records", tmp_path / "scratch", tmp_path / "state" / "k"):
+        with pytest.raises(ValueError, match="overlaps (scratch|state) dir"):
+            keep.Keeper(bad, spool, tmp_path / "dl", tmp_path / "out", scratch_dir=tmp_path / "scratch",
+                        state_dir=tmp_path / "state")
+    assert not (tmp_path / "scratch").exists()
+    # the process role passes its scratch and state dirs
+    from envision_eye_actionable.survey import pipeline, runner
+    monkeypatch.setattr(runner, "OnnxClassifier", _OnnxStub)
+    meta = _write_records(tmp_path, {"3301": {"0.png": b"x"}})
+    for i, (bad, what) in enumerate((("scratch/records", "scratch"), ("st1/keep", "state"))):
+        cfg = _cfg(tmp_path, meta, keep_dir=tmp_path / bad, spool_dir=tmp_path / f"spool{i}",
+                   state_dir=tmp_path / f"st{i}")
+        with pytest.raises(ValueError, match=f"overlaps {what} dir"):
+            pipeline.Processor(cfg)
     foreign = tmp_path / "data"
     foreign.mkdir()
     (foreign / "x.txt").write_text("mine")

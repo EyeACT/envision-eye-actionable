@@ -31,6 +31,13 @@ consumer finds the record's row newer than the marker, sees kept = true,
 moves what is left and writes the marker again. A file moved again onto an
 existing path replaces it (same bytes, same name): nothing is duplicated.
 
+A move that fails (an OSError) is tried again after a backoff; after three
+failures the record is parked: its spool dir gets a KEEP_FAILED marker and
+stays, with the files that did not move, and neither role touches it until
+the next process role with ``--keep-dir`` tries again. A consumer run
+without ``--keep-dir`` parks, never deletes, a record whose row says kept
+and whose files are not all moved.
+
 Guards (a record that is not kept gets kept = false and kept_reason; its
 files are deleted as before; kept records are never deleted by the
 survey):
@@ -130,10 +137,14 @@ class Keeper:
 
     def __init__(self, keep_dir: Path, spool, downloads_dir: Path | None = None, out_dir: Path | None = None,
                  max_bytes: float | None = None, floor_bytes: float = 0, spool_max_bytes: float = 0,
-                 status_path: Path | None = None, log_event=None):
+                 status_path: Path | None = None, log_event=None, scratch_dir: Path | None = None,
+                 state_dir: Path | None = None):
         self.root = Path(keep_dir).resolve()
         self.spool = spool
-        for name, other in (("spool dir", spool.root), ("downloads dir", downloads_dir), ("output dir", out_dir)):
+        # the scratch dir matters most: the survey sweeps every all-digit
+        # dir under <scratch>/records, which is what a keep dir holds
+        for name, other in (("spool dir", spool.root), ("downloads dir", downloads_dir), ("output dir", out_dir),
+                            ("scratch dir", scratch_dir), ("state dir", state_dir)):
             if other is None:
                 continue
             o = Path(other).resolve()
@@ -205,6 +216,14 @@ class Keeper:
                 b = self._dir_bytes(d)[0]
             self.per_record[d.name] = b
         self.total_bytes = sum(self.per_record.values())
+
+    def account(self, rid: str):
+        """Re-measure one record's keep dir (after a partial move)."""
+        d = self.record_dir(rid)
+        if d.is_dir():
+            self.per_record[rid] = self._dir_bytes(d)[0]
+        self.total_bytes = sum(self.per_record.values())
+        self.write_status()
 
     def summary(self) -> dict:
         return {"dir": str(self.root), "records": len(self.per_record), "bytes": self.total_bytes,

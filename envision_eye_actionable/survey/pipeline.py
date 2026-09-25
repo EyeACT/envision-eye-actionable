@@ -493,6 +493,8 @@ class Producer:
         st = self.spool.state(rid)
         if st in ("ready", "awaiting_deep", "deep_ready"):
             return "skipped_in_spool"
+        if st == "keep_failed":
+            return "skipped_keep_failed"         # finished; its files wait for the keep dir
         if st == "fetching":
             # left by a killed producer (only one producer runs per state dir)
             self.spool.remove(rid)
@@ -601,7 +603,8 @@ class Producer:
         # records a previous producer left ready, awaiting_deep or deep_ready
         # belong to the consumer and the request files, not to the queue
         # (fetching dirs stay in the queue: they are removed and refetched)
-        owned = {rid for rid, st in self.spool.states().items() if st in ("ready", "awaiting_deep", "deep_ready")}
+        owned = {rid for rid, st in self.spool.states().items()
+                 if st in ("ready", "awaiting_deep", "deep_ready", "keep_failed")}
         todo = [r for r in todo if r["source_id"] not in owned]
         # dirs a killed producer left half written, whatever this run's
         # --ids / --limit / --retry-status: they take room in the spool
@@ -743,8 +746,13 @@ class Processor:
             self.keeper = Keeper(cfg.keep_dir, self.spool, cfg.downloads_dir, cfg.out_dir,
                                  max_bytes=keep_max * 1e9 if keep_max else None,
                                  floor_bytes=cfg.disk_floor_gb * 1e9, spool_max_bytes=cfg.spool_max_gb * 1e9,
-                                 status_path=self.state / STATUS_NAME, log_event=self.survey_event)
+                                 status_path=self.state / STATUS_NAME, log_event=self.survey_event,
+                                 scratch_dir=cfg.scratch_dir, state_dir=self.state)
             self.status.update(keep=self.keeper.summary())
+            # records parked by an earlier consumer (moves that failed, or a
+            # run without --keep-dir): their moves are tried again now
+            for rid in self.spool.clear_keep_failed():
+                self.survey_event({"event": "keep_retry_after_restart", "record": rid})
         self._stop = False
         self._in_record: tuple[str, int] | None = None     # (record id, attempts before the bump)
 
@@ -851,8 +859,17 @@ class Processor:
             # deleting the dir; do not classify it a second time. A record
             # whose row says kept: the move a kill interrupted is finished
             # first (keep.py).
-            if self.keeper is not None and self.results.kept.get(rid):
-                if not self._keep_move(rid, None):
+            if self.results.kept.get(rid):
+                if self.keeper is None:
+                    # its row says kept but this consumer has no keep dir: the
+                    # files that did not move yet are never deleted
+                    from .keep import keep_plan
+                    left = len(keep_plan(rdir))
+                    if left:
+                        self.spool.mark_keep_failed(rid, "row says kept; no --keep-dir in this run")
+                        self.survey_event({"event": "keep_parked_no_keep_dir", "record": rid, "files_left": left})
+                        return "keep_parked"
+                elif not self._keep_move(rid, None):
                     return "keep_move_retry"
             self.spool.remove(rid)
             self.survey_event({"event": "spool_already_done", "record": rid})
@@ -898,12 +915,16 @@ class Processor:
             self._in_record = None
 
     KEEP_MOVE_TRIES = 3
+    keep_retry_s = 2.0                           # backoff base between failed tries (2 s, then 4 s)
 
     def _keep_move(self, rid: str, local) -> bool:
-        """Move the record's files to the keep dir. False when the move
-        failed and will be tried again (the spool dir stays); after
-        KEEP_MOVE_TRIES failures the record's remaining files are given up
-        (logged) so that one bad file never blocks the consumer."""
+        """Move the record's files to the keep dir. True when every file
+        moved (the caller may then delete the spool dir). False otherwise,
+        and the spool dir must stay: the move is tried again (after a
+        backoff) from the already_done path, and after KEEP_MOVE_TRIES
+        failures the record is parked (keep_failed: its unmoved files stay in
+        the spool, nothing deletes them, the consumer goes on with other
+        records; the next process role start tries again)."""
         try:
             res = self.keeper.move(rid, local)
         except OSError as e:
@@ -911,10 +932,19 @@ class Processor:
             self.keeper.failures[rid] = n
             self.survey_event({"event": "keep_move_failed", "record": rid, "try": n,
                                "error": redact(f"{type(e).__name__}: {e}")[:300]})
+            self.keeper.account(rid)             # the files that did move count against --keep-max-gb
+            self.status.update(keep=self.keeper.summary())
             if n < self.KEEP_MOVE_TRIES:
+                if self.keep_retry_s > 0:
+                    time.sleep(self.keep_retry_s * 2 ** (n - 1))
                 return False
-            self.survey_event({"event": "keep_move_gave_up", "record": rid})
-            return True
+            from .keep import keep_plan
+            left = len(keep_plan(self.spool.record_dir(rid)))
+            self.spool.mark_keep_failed(rid, f"keep move failed {n} times: {redact(type(e).__name__)}")
+            self.keeper.failures.pop(rid, None)
+            self.status.count("keep_failed")
+            self.survey_event({"event": "keep_move_gave_up", "record": rid, "files_left_in_spool": left})
+            return False
         self.keeper.failures.pop(rid, None)
         self.status.count("kept")
         self.status.update(keep=self.keeper.summary())
