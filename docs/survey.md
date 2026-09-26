@@ -1307,14 +1307,23 @@ CDS v0.1.1, and they are bundled in `survey/resources/schemas/`.
       reported by the depositor, false flags meaning not reported, not
       confirmed absent. Provenance `derived (public release on Zenodo as
       image files; methods not reported by the depositor)`.
-    - restricted, closed and embargoed records, and open records with no
-      image file read (no files, no image files, or files not read):
-      "Deposited on Zenodo (access_right: <x>; files not publicly
-      released, no image files read)" (or "; no image files read" for open
-      records), followed by the statement that the flags are a project
+    - restricted, closed and embargoed records: "Access restricted by the
+      depositor on Zenodo" ("Embargoed by the depositor on Zenodo until
+      <date>" when the legacy JSON or enrich-access gives the embargo end;
+      "Access closed ..." for closed records) "(access_right: <x>; files
+      not publicly released, no image files read), so de-identification is
+      not reported", followed by the statement that the enum and flags are
+      only the project default the required field needs, not a statement
+      about these files. Provenance `derived (Zenodo deposit, access_right
+      <x>; access restricted by the depositor, de-identification not
+      reported)`.
+    - open records with no image file read (no files, no image files, or
+      files not read): "Deposited on Zenodo (access_right: open; no image
+      files read)", followed by the statement that the flags are a project
       default because the depositor does not report the methods, and the
       same not-reported meaning of the false flags. Provenance `derived
-      (Zenodo deposit, access_right <x>; ...; methods not reported)`.
+      (Zenodo deposit, access_right open; no image files read; methods not
+      reported)`.
 
     Both provenance strings start with `derived`, so the field is listed
     with the derived fields. `NoDeIdentification` would claim it was
@@ -1340,6 +1349,73 @@ CDS v0.1.1, and they are bundled in `survey/resources/schemas/`.
   into the description text and `alternateIdentifier` instead.
   `urlLastChecked` is omitted with it, since no URL was checked.
 
+## Restricted and embargoed records (`enrich-access`)
+
+A restricted Zenodo record has public metadata but hidden files: the file
+list is empty and the owner grants access case by case through "Request
+access" on the landing page. The survey gives such records the status
+`restricted` and reads no file. `enrich-access` is a side command that adds
+what a person needs to decide whether to ask for access, without touching
+the survey's results:
+
+```bash
+envision-survey enrich-access --scrape results/zenodo_full.json \
+    --survey-out-dir results/survey_pull --out-dir results/survey_pull_access \
+    --rpm 10 --shared-state-dir results/survey_pull_state
+envision-survey excel --results-dir results/survey_pull --results-dir results/survey_pull_access \
+    --out results/zenodo_modality_survey.xlsx
+```
+
+Targets are the scrape records with `access_type` restricted or
+embargoed, and the records whose last results row has status restricted,
+embargoed or closed, or an `access_right` of restricted, embargoed or
+closed. For each it fetches the InvenioRDM record JSON (`Accept:
+application/vnd.inveniordm.v1+json`, one request, cached under
+`<out-dir>/cache/invenio`) and writes one line to
+`<out-dir>/access_results.jsonl`:
+
+| Field | From |
+|---|---|
+| `access_record`, `access_files`, `access_status` | the record's `access` block (`public` / `restricted`; status `open`, `restricted`, `embargoed`, `metadata-only`) |
+| `access_embargo_active`, `access_embargo_until`, `access_embargo_reason` | `access.embargo` |
+| `access_files_public_now` | files `public` and no active embargo |
+| `access_allow_user_requests`, `access_allow_guest_requests`, `access_accept_conditions_text` | the parent record's `access.settings`, which Zenodo shows to any reader: whether the owner accepts requests from logged-in users, from guests, and the owner's conditions. Empty when Zenodo does not expose them (`access_settings_exposed` false), never guessed |
+| `access_request_url`, `access_request_api` | the landing page (the form is there) and `links.access_request` |
+| `access_request_note` | one line on how to get the files |
+| `access_license_ids`, `access_license`, `access_license_use` | `metadata.rights` (the scrape's license when the record has none): `train` (CC0, CC-BY, CC-BY-SA, ODC-BY, PDDL, MIT, BSD, Apache, public domain), `evaluate_only_nc_nd` (any NC or ND license: internal evaluation only, never training), `no_license` (do not train), `check_license` (anything else) |
+| `access_resource_type`, `access_title` | `metadata` |
+| `access_setfit_label`, `access_setfit_prob` | the discovery scrape |
+| `access_keyword_terms`, `access_keyword_match` | eye imaging terms in title, keywords, subjects and description |
+| `access_eye_relevant` | SetFit label EYE_IMAGING, p(eye imaging) at least 0.5, or a keyword match |
+
+For records whose files are still not public it also writes the two CMDS
+documents again from the full metadata (legacy and DataCite JSON, read
+from the survey's `cache/` when there, else fetched into its own cache)
+into `<out-dir>/cmds/<id>/`, with the non-public de-identification text
+above and an `accessDetails` text that says whether the owner takes
+requests and until when an embargo runs. Records whose files have become
+public keep the survey's own CMDS.
+
+The job is resumable (records with a successful row are skipped; a failed
+fetch is tried again on the next run; `--refresh` fetches all again). It
+never writes into the survey's out dir: an `--out-dir` that is, contains or
+lies inside `--survey-out-dir`, or holds a `survey_results.jsonl`, is
+refused. Every request goes through the survey's Zenodo client, so with
+the running survey's `--shared-state-dir` both stay under `--shared-rpm`
+together and share a 429 cooldown; `--rpm` (default 10) is the job's share.
+Progress and counts go to `<out-dir>/access_summary.json`.
+
+In `excel`, a `--results-dir` holding `access_results.jsonl` is a
+supplement: its rows set only the `access_*`, `cmds_*`, `dd_*` and `dsd_*`
+fields of the survey rows with the same id (the last supplement dir given
+wins; its CMDS folders resolve against its own dir), never the status or
+classification columns, and it adds the Access_Requests sheet.
+
+Access is granted to a Zenodo account: once an owner accepts a request,
+the files open for that account on the website and for API requests made
+with a personal access token of the same account (`--token-file`), so a
+later survey run with that token reads them.
+
 ## Workbook sheets
 
 | Sheet | Content |
@@ -1352,7 +1428,9 @@ CDS v0.1.1, and they are bundled in `survey/resources/schemas/`.
 | Schema_Fields | each AI-READI / CMDS field, its mapping rule and how many records took it from which source (directoryList counts only records with at least one modality directory) |
 | Archive_Probes | one row per archive probed before a download: outcome, method, members, images, bytes, requests |
 | CMDS_JSON | the two CMDS JSON documents of every record, as text, with the full CMDS JSON folder (results dir plus `cmds/<id>`); above 2000 records (`--cmds-json auto`, the default) their file paths and sizes instead, so the workbook stays small; `--cmds-json embed` or `paths` forces one form |
+| Access_Requests | only with an `enrich-access` supplement dir: eye-relevant records whose files are not public, ranked by the discovery SetFit p(eye imaging): title, SetFit label and probability, eye keywords, license and license use, resource type, access status, embargo, whether the owner accepts requests, the owner's conditions, the landing page to request access on, the API link and the survey status |
 | Formats | classified images by source format, files that gave no image by source format, and classified images by conversion path, each with its record count, over all records |
+| Model_Training_Datasets | only with `--training-sources <csv>`: the classifier's training and evaluation sources, one row per (model_version, source, class), copied from the CSV as given (license, role, image counts; a retrain appends rows under a new model_version). The CSV needs a `model_version` column; the README gets a per-version summary (sources, classes, training and test images, synthetic and evaluation-only sources, and sources the CSV's `training_policy` does not mark `allowed`). The CSV is kept with the model, not in this repository |
 
 The workbook is written in openpyxl's write-only mode from an index of the
 results file (byte offsets of each record's winning line), one row in

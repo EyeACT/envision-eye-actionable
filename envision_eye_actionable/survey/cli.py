@@ -11,6 +11,8 @@ Subcommands:
     envision-survey excel        build the workbook from survey_results.jsonl (one or several runs)
     envision-survey partition    id lists by expected mode (local, remote_zip, download, none)
     envision-survey keep-backfill-ids  ids finished before --keep-dir existed that hold an eye image
+    envision-survey enrich-access  access facts (embargo, request settings, license) and CMDS of the
+                                   restricted and embargoed records, into a supplement dir for excel
     envision-survey export-onnx  export the timm checkpoint to ONNX (needs torch + timm)
 
 The full pull (see docs/survey.md):
@@ -247,13 +249,19 @@ def _add_excel(sub):
                    help="results JSONL (ignored when --results-dir is given)")
     p.add_argument("--results-dir", type=Path, action="append", default=[],
                    help="a run's --out-dir; repeat to merge the runs of several processes (rows merged by "
-                        "record id, the last dir given wins; CMDS files read from each row's own dir)")
+                        "record id, the last dir given wins; CMDS files read from each row's own dir). A dir "
+                        "with access_results.jsonl (enrich-access --out-dir) is a supplement: it sets only the "
+                        "access and CMDS fields of the rows and adds the Access_Requests sheet")
     p.add_argument("--out", type=Path, default=Path("./results/survey/zenodo_modality_survey.xlsx"))
     p.add_argument("--model", type=Path, default=_default_model(),
                    help=f"ONNX model whose .json sidecar goes into the README (default: ${MODEL_ENV})")
     p.add_argument("--cmds-json", choices=("auto", "embed", "paths"), default="auto",
                    help="CMDS_JSON sheet: the documents as text (embed), their file paths and sizes (paths), "
                         "or auto: embed up to 2000 records (default auto)")
+    p.add_argument("--training-sources", type=Path, default=None,
+                   help="CSV of the classifier's training and evaluation sources (one row per model_version, "
+                        "source and class; needs a model_version column), copied to a Model_Training_Datasets "
+                        "sheet and summarised in the README (default: sheet left out)")
 
 
 def _add_partition(sub):
@@ -279,6 +287,37 @@ def _add_keep_backfill(sub):
     p.add_argument("--output", type=Path, required=True, help="where the ids go, one per line")
 
 
+def _add_enrich_access(sub):
+    p = sub.add_parser("enrich-access",
+                       help="fetch the InvenioRDM record JSON of restricted and embargoed records: access, "
+                            "embargo, request settings, license, CMDS; rows into <out-dir>/access_results.jsonl")
+    p.add_argument("--scrape", type=Path, default=Path("./results/zenodo_all_results.json"))
+    p.add_argument("--survey-out-dir", type=Path, default=None,
+                   help="the survey's --out-dir: survey_results.jsonl picks further targets (status or "
+                        "access_right restricted, embargoed, closed) and its cache/ gives legacy and DataCite "
+                        "JSON; only read, never written")
+    p.add_argument("--out-dir", type=Path, required=True,
+                   help="where access_results.jsonl, access_summary.json, cmds/<id>/ and cache/ go (its own "
+                        "dir, e.g. results/<run>/access; never the survey's out dir)")
+    p.add_argument("--read-cache-dir", type=Path, action="append", default=None,
+                   help="metadata caches read before fetching (legacy/ and datacite/ subdirs); repeatable "
+                        "(default: <survey-out-dir>/cache)")
+    p.add_argument("--rpm", type=int, default=10,
+                   help="Zenodo requests per minute of this job (default 10: a small share next to a running "
+                        "survey)")
+    p.add_argument("--shared-state-dir", type=Path, default=None,
+                   help="the running survey's shared state dir, so both stay under --shared-rpm together and "
+                        "share a 429 cooldown")
+    p.add_argument("--shared-rpm", type=int, default=120)
+    p.add_argument("--token-file", type=Path, default=None,
+                   help="as in run (default ~/.config/envision-survey/zenodo_token when it exists)")
+    p.add_argument("--ids", nargs="+", default=[], help="only these record ids (among the targets)")
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--refresh", action="store_true", help="fetch again the records already done")
+    p.add_argument("--no-cmds", action="store_true", help="do not write the CMDS documents")
+    p.add_argument("--offline", action="store_true", help="no Zenodo requests (cache only)")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="envision-survey",
@@ -289,6 +328,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_excel(sub)
     _add_partition(sub)
     _add_keep_backfill(sub)
+    _add_enrich_access(sub)
     from .export_onnx import add_arguments as _onnx_args
     _onnx_args(sub.add_parser("export-onnx", help="export the timm checkpoint to ONNX (needs torch + timm)"))
     args = parser.parse_args(argv)
@@ -306,10 +346,25 @@ def main(argv: list[str] | None = None) -> int:
             missing = [d for d in args.results_dir if not d.is_dir()]
             if missing:
                 parser.error(f"--results-dir {missing[0]} does not exist")
-            source = [d / "survey_results.jsonl" for d in args.results_dir]
+            from .excel import SUPPLEMENT_NAME, split_results_dirs
+            source, supplements, empty = split_results_dirs(args.results_dir)
+            if empty:
+                parser.error(f"--results-dir {empty[0]} holds neither survey_results.jsonl nor {SUPPLEMENT_NAME}")
+            if not source:
+                parser.error("--results-dir: no survey_results.jsonl in any dir given (supplements alone "
+                             "make no workbook)")
         else:
-            source = args.results
-        stats = build_workbook(source, args.out, load_model_meta(args.model), cmds_json=args.cmds_json)
+            source, supplements = args.results, []
+        if args.training_sources is not None:
+            if not args.training_sources.is_file():
+                parser.error(f"--training-sources {args.training_sources} does not exist")
+            from .excel import load_training_sources
+            try:
+                load_training_sources(args.training_sources)
+            except ValueError as e:
+                parser.error(str(e))
+        stats = build_workbook(source, args.out, load_model_meta(args.model), cmds_json=args.cmds_json,
+                               training_sources=args.training_sources, supplements=supplements)
         print(json.dumps(stats, indent=2), flush=True)
         return 0
 
@@ -324,6 +379,31 @@ def main(argv: list[str] | None = None) -> int:
         tmp.write_text("".join(i + "\n" for i in ids), encoding="utf-8")
         tmp.replace(args.output)
         print(json.dumps({**summary, "output": str(args.output)}, indent=2), flush=True)
+        return 0
+
+    if args.cmd == "enrich-access":
+        from .access import AccessEnricher
+        from .zenodo import install_log_redaction
+        logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+        install_log_redaction()
+        if not args.scrape.is_file():
+            parser.error(f"--scrape {args.scrape} not found")
+        if args.survey_out_dir is not None and not (args.survey_out_dir / "survey_results.jsonl").is_file():
+            parser.error(f"--survey-out-dir {args.survey_out_dir} has no survey_results.jsonl")
+        if args.token_file is not None and not args.token_file.expanduser().is_file():
+            parser.error(f"--token-file {args.token_file} not found")
+        if args.rpm < 1:
+            parser.error("--rpm must be at least 1")
+        try:
+            enricher = AccessEnricher(args.scrape, args.survey_out_dir, args.out_dir,
+                                      read_cache_dirs=args.read_cache_dir, rpm=args.rpm,
+                                      shared_state_dir=args.shared_state_dir, shared_rpm=args.shared_rpm,
+                                      token_file=args.token_file, offline=args.offline,
+                                      write_cmds=not args.no_cmds, refresh=args.refresh)
+        except ValueError as e:
+            parser.error(str(e))
+        stats = enricher.run(ids=args.ids or None, limit=args.limit)
+        print(json.dumps(stats, indent=2), flush=True)
         return 0
 
     if args.cmd == "partition":

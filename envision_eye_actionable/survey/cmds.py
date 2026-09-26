@@ -171,8 +171,10 @@ MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".tif"
 #   a re-analysis. The enum and the booleans are the same for every record;
 #   only the deIdentDetails text (and the provenance) depends on the record:
 #   "Publicly released on Zenodo as image files" only for open records with
-#   image files, else a statement of the access right and that no image file
-#   was read (deident_level).
+#   image files; for restricted, embargoed and closed records, that the
+#   depositor restricts access and de-identification is not reported; else a
+#   statement of the access right and that no image file was read
+#   (deident_level).
 # * Consent: the least assertive value the schema accepts,
 #   ConsentSpecifiedNotElsewhereCategorised ("a descriptive statement
 #   regarding consent is available, but it does not fit into categories
@@ -195,14 +197,33 @@ DEIDENT_PUBLIC_RELEASE = {
 DEIDENT_PROVENANCE = "derived (public release on Zenodo as image files; methods not reported by the depositor)"
 
 
-def deident_level(access_right: str, has_images: bool) -> tuple[dict, str]:
+# Records whose files the depositor keeps from the public (Zenodo access_right).
+NON_PUBLIC_ACCESS = {"restricted": "Access restricted by the depositor",
+                     "embargoed": "Embargoed by the depositor",
+                     "closed": "Access closed by the depositor"}
+
+
+def deident_level(access_right: str, has_images: bool, embargo_until: str | None = None) -> tuple[dict, str]:
     """(datasetDeIdentLevel, provenance) for a record. The enum and the five
     booleans never change; the free text says what is known: a public
-    release as image files only for open records with image files, else the
-    access right and that no image file was read, with the flags applied as
-    a project default."""
+    release as image files only for open records with image files; for
+    restricted, embargoed and closed records that the depositor restricts
+    access and that de-identification is not reported (``embargo_until``,
+    when known, names the embargo end); else the access right and that no
+    image file was read, with the flags applied as a project default."""
     if access_right == "open" and has_images:
         return dict(DEIDENT_PUBLIC_RELEASE), DEIDENT_PROVENANCE
+    if access_right in NON_PUBLIC_ACCESS:
+        until = f" until {embargo_until}" if access_right == "embargoed" and embargo_until else ""
+        details = (f"{NON_PUBLIC_ACCESS[access_right]} on Zenodo{until} (access_right: {access_right}; files "
+                   "not publicly released, no image files read), so de-identification is not reported: nothing "
+                   "is known about how these files were de-identified. The enum and flags (deIdentDirect true; "
+                   "deIdentHIPAA, deIdentDates, deIdentNonarr, deIdentKAnon false) are only the project default "
+                   "that this required field needs, not a statement about these files. Set by EyeACT "
+                   "harvesting; ask the depositor when requesting access.")
+        return ({**DEIDENT_PUBLIC_RELEASE, "deIdentDetails": details},
+                f"derived (Zenodo deposit, access_right {access_right}; access restricted by the depositor, "
+                "de-identification not reported)")
     why = ("files not publicly released, no image files read" if access_right != "open"
            else "no image files read")
     details = (f"Deposited on Zenodo (access_right: {access_right or 'unknown'}; {why}). Direct identifiers "
@@ -392,7 +413,8 @@ def build_dataset_description(scrape: dict, legacy: dict | None, datacite: dict 
 
     access_right = (lmeta.get("access_right") or scrape.get("access_type") or "open").lower()
     has_images = bool(summary.get("n_images") or summary.get("image_ext_counts") or present)
-    doc["datasetDeIdentLevel"], prov["datasetDeIdentLevel"] = deident_level(access_right, has_images)
+    doc["datasetDeIdentLevel"], prov["datasetDeIdentLevel"] = deident_level(
+        access_right, has_images, lmeta.get("embargo_date"))
     doc["datasetConsent"] = dict(PLACEHOLDER_CONSENT)
     prov["datasetConsent"] = "placeholder (not reported by source)"
 

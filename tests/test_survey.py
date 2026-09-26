@@ -1325,6 +1325,12 @@ def test_deident_text_follows_the_access_right_and_the_images(access, summary):
     assert f"access_right: {access}" in de["deIdentDetails"] and "no image files read" in de["deIdentDetails"]
     assert "project default" in de["deIdentDetails"]
     assert prov["datasetDeIdentLevel"].startswith(f"derived (Zenodo deposit, access_right {access}")
+    if access in ("restricted", "closed"):
+        assert "by the depositor" in de["deIdentDetails"]
+        assert "de-identification is not reported" in de["deIdentDetails"]
+        assert "de-identification not reported" in prov["datasetDeIdentLevel"]
+    else:
+        assert "de-identification is not reported" not in de["deIdentDetails"]
     if access == "closed":
         assert "not available from Zenodo" in dd["accessDetails"]["description"]
     assert cmds.validate(dd, "dataset_description") == []

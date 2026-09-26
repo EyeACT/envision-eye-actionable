@@ -11,6 +11,22 @@ Sheets:
     CMDS_JSON       the two CMDS JSON documents of every record, as text (or,
                     for large runs, their file paths)
     Formats         source formats and conversion paths over all records
+    Access_Requests eye-relevant restricted and embargoed records, ranked by
+                    the discovery SetFit probability (only with an
+                    enrich-access supplement, see below)
+    Model_Training_Datasets
+                    the classifier's training and evaluation sources, one row
+                    per (model_version, source, class), copied from the CSV
+                    given as --training-sources (only then)
+
+Supplements: a results dir holding ``access_results.jsonl`` (written by
+``envision-survey enrich-access``) is a supplement, not a run. Its rows are
+laid over the survey rows of the same record id, but only their access and
+CMDS fields (``access_*``, ``cmds_*``, ``dd_*``, ``dsd_*``; see
+SUPPLEMENT_PREFIXES): the survey's status and classification columns are
+never replaced. Among several supplements the last dir given wins. Its CMDS
+folders are resolved against the supplement's own dir. Supplement rows of
+records not in any results file only reach the Access_Requests sheet.
 
 The workbook is written in openpyxl's write-only mode from an index of the
 results JSONL (one row in memory at a time), so it scales to the full
@@ -227,6 +243,37 @@ RECORD_COLUMNS: list[tuple[str, str]] = [
     ("kept_bytes", "Bytes kept"),
     ("kept_local_files", "Local originals (not moved; paths in KEPT.json)"),
     ("finished_at", "Finished at (UTC)"),
+    ("access_status", "Zenodo access status (enrich-access)"),
+    ("access_files", "Zenodo files access (enrich-access)"),
+    ("access_embargo_until", "Embargo until (enrich-access)"),
+    ("access_allow_user_requests", "Owner accepts access requests (enrich-access; empty: not exposed)"),
+    ("access_request_note", "How to get the files (enrich-access)"),
+    ("access_request_url", "Request access on (landing page)"),
+    ("access_license_use", "License use: train, evaluate_only_nc_nd, no_license, check_license (enrich-access)"),
+    ("access_eye_relevant", "Eye-relevant by SetFit or keywords (enrich-access)"),
+    ("access_keyword_terms", "Eye keywords matched (enrich-access)"),
+    ("access_checked_at", "Access checked at (UTC)"),
+]
+
+# Fields a supplement row (enrich-access) may set on a survey row. Nothing
+# else: status and classification columns always come from the survey.
+SUPPLEMENT_PREFIXES = ("access_", "cmds_", "dd_", "dsd_")
+SUPPLEMENT_NAME = "access_results.jsonl"
+
+ACCESS_REQUEST_COLUMNS = [
+    ("rank", "Rank (by SetFit p(eye imaging))"), ("record_id", "Zenodo record id"), ("title", "Title"),
+    ("access_setfit_label", "Discovery SetFit label"), ("access_setfit_prob", "Discovery SetFit p(eye imaging)"),
+    ("access_keyword_terms", "Eye keywords matched"), ("access_license", "License"),
+    ("access_license_use", "License use (train, evaluate_only_nc_nd, no_license, check_license)"),
+    ("access_resource_type", "Resource type"), ("access_status", "Zenodo access status"),
+    ("access_files", "Files access"), ("access_embargo_active", "Embargo active"),
+    ("access_embargo_until", "Embargo until"), ("access_embargo_reason", "Embargo reason"),
+    ("access_allow_user_requests", "Owner accepts requests from Zenodo users (empty: not exposed)"),
+    ("access_allow_guest_requests", "Owner accepts guest requests"),
+    ("access_accept_conditions_text", "Owner's conditions"), ("access_request_note", "How to get the files"),
+    ("url", "Request access on (landing page)"), ("access_request_api", "Access request API link"),
+    ("access_survey_status", "Survey status"), ("cmds_folder", "CMDS JSON folder"),
+    ("access_checked_at", "Checked at (UTC)"),
 ]
 
 WEBLINK_COLUMNS = [
@@ -266,7 +313,10 @@ SCHEMA_FIELDS = [
                                                         "does not report the methods (false = not reported, not "
                                                         "confirmed absent). deIdentDetails says 'Publicly released on "
                                                         "Zenodo as image files' only for open records with image "
-                                                        "files; otherwise it names the access_right and that no image "
+                                                        "files; for restricted, embargoed and closed records it says "
+                                                        "access is restricted by the depositor and de-identification "
+                                                        "is not reported (enrich-access adds the embargo end); "
+                                                        "otherwise it names the access_right and that no image "
                                                         "file was read"),
     ("dataset_description", "datasetConsent", True, "PLACEHOLDER, not reported by source: "
                                                    "ConsentSpecifiedNotElsewhereCategorised (least assertive schema "
@@ -444,9 +494,53 @@ def merge_index(results_paths: list[Path]) -> dict[str, tuple[int, int, str | No
     return merged
 
 
-def _iter_rows(paths: list[Path], index: dict[str, tuple[int, int, str | None]], order: list[str]):
+def split_results_dirs(dirs: list[Path]) -> tuple[list[Path], list[Path], list[Path]]:
+    """(survey results files, supplement files, dirs with neither) of the
+    --results-dir values, in the order given. A dir may hold both."""
+    source, supplements, empty = [], [], []
+    for d in dirs:
+        res, sup = Path(d) / "survey_results.jsonl", Path(d) / SUPPLEMENT_NAME
+        if res.is_file():
+            source.append(res)
+        if sup.is_file():
+            supplements.append(sup)
+        if not res.is_file() and not sup.is_file():
+            empty.append(Path(d))
+    return source, supplements, empty
+
+
+def load_supplements(paths: list[Path] | None) -> dict[str, dict]:
+    """Supplement rows (enrich-access) by record id: the last line per id in
+    a file and the last file given win. Each row remembers its file
+    (``_supplement_path``)."""
+    out: dict[str, dict] = {}
+    for path in paths or []:
+        for rid, row in load_results(path).items():
+            row["_supplement_path"] = str(path)
+            out[rid] = row
+    return out
+
+
+def overlay_supplement(row: dict, supp: dict | None) -> dict:
+    """Lay a supplement row over a survey row: only the fields named by
+    SUPPLEMENT_PREFIXES are set (a supplement CMDS folder then resolves
+    against the supplement's dir); every other field stays the survey's."""
+    if not supp:
+        return row
+    for k, v in supp.items():
+        if k.startswith(SUPPLEMENT_PREFIXES):
+            row[k] = v
+    if supp.get("cmds_dir"):
+        row["cmds_dir"] = supp["cmds_dir"]
+        row["_cmds_base"] = supp["_supplement_path"]
+    return row
+
+
+def _iter_rows(paths: list[Path], index: dict[str, tuple[int, int, str | None]], order: list[str],
+               supplements: dict[str, dict] | None = None):
     """Rows of ``index`` in ``order``, read one at a time by offset, with
-    _results_path (and results_dir when several files) and the backfill."""
+    _results_path (and results_dir when several files), the backfill and the
+    supplement fields (overlay_supplement)."""
     labels = results_dir_labels(paths) if len(paths) > 1 else {}
     fps = {}
     try:
@@ -462,27 +556,115 @@ def _iter_rows(paths: list[Path], index: dict[str, tuple[int, int, str | None]],
             if labels:
                 row["results_dir"] = labels[str(own)]
             backfill(row)
+            overlay_supplement(row, (supplements or {}).get(rid))
             if row.get("cmds_dir"):
-                row["_cmds_folder"] = str(_cmds_folder(row["cmds_dir"], own))
-                row["cmds_dir"] = _rel_cmds_dir(row["cmds_dir"], own)
-                row["cmds_folder"] = _cmds_folder(row["cmds_dir"], own.resolve()).as_posix()
+                base = Path(row.pop("_cmds_base", None) or own)
+                row["_cmds_folder"] = str(_cmds_folder(row["cmds_dir"], base))
+                row["cmds_dir"] = _rel_cmds_dir(row["cmds_dir"], base)
+                row["cmds_folder"] = _cmds_folder(row["cmds_dir"], base.resolve()).as_posix()
             yield row
     finally:
         for fp in fps.values():
             fp.close()
 
 
+def access_request_rows(supplements: dict[str, dict]) -> list[dict]:
+    """Access_Requests rows: eye-relevant records whose files are not public,
+    highest SetFit p(eye imaging) first (none last), then by record id."""
+    rows = []
+    for rid, s in supplements.items():
+        if not s.get("access_eye_relevant") or s.get("access_files_public_now"):
+            continue
+        d = {k: v for k, v in s.items() if not k.startswith("_")}
+        d["record_id"] = rid
+        d["title"] = s.get("access_title")
+        d["url"] = s.get("access_request_url")
+        if s.get("cmds_dir"):
+            d["cmds_folder"] = _cmds_folder(s["cmds_dir"], Path(s["_supplement_path"]).resolve()).as_posix()
+        rows.append(d)
+
+    def key(d):
+        p = d.get("access_setfit_prob")
+        p = p if isinstance(p, (int, float)) else -1.0
+        rid = str(d["record_id"])
+        return (-p, int(rid) if rid.isdigit() else 0, rid)
+    rows.sort(key=key)
+    for i, d in enumerate(rows, 1):
+        d["rank"] = i
+    return rows
+
+
 EMBED_CMDS_MAX_ROWS = 2000     # CMDS_JSON embeds the documents up to this many records (auto)
+
+TRAINING_SHEET = "Model_Training_Datasets"
+# Columns of a training sources CSV that the README summary reads; any other
+# column is copied to the sheet as is, in the CSV's order.
+TRAINING_REQUIRED = ("model_version",)
+
+
+def load_training_sources(path: Path) -> tuple[list[str], list[dict]]:
+    """(columns, rows) of a training sources CSV: one row per (model_version,
+    source, class). Needs a model_version column so that a retrain can append
+    its own rows next to the earlier model's. Blank lines are skipped."""
+    import csv
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        columns = [c for c in (reader.fieldnames or []) if c]
+        missing = [c for c in TRAINING_REQUIRED if c not in columns]
+        if missing:
+            raise ValueError(f"{path}: training sources CSV has no {', '.join(missing)} column")
+        rows = [r for r in reader if any((v or "").strip() for k, v in r.items() if k)]
+    return columns, rows
+
+
+def _int(v) -> int:
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return 0
+
+
+def training_summary(rows: list[dict]) -> str:
+    """README text: per model_version, sources, classes, training and test
+    images, synthetic and evaluation-only sources, sources whose license the
+    CSV marks as not cleared for training."""
+    parts = []
+    for mv in dict.fromkeys(r.get("model_version") or "(none)" for r in rows):
+        rs = [r for r in rows if (r.get("model_version") or "(none)") == mv]
+        classes = sorted({r.get("class") for r in rs if r.get("class")})
+        text = f"{mv}: {len(rs)} source rows"
+        if classes:
+            text += f" over {len(classes)} classes ({', '.join(classes)})"
+        for col, label in (("student_train_n", "training images"), ("student_test_n", "test images")):
+            if any(col in r for r in rs):
+                text += f", {sum(_int(r.get(col)) for r in rs)} {label}"
+        synth = [r.get("source_id") or "?" for r in rs if str(r.get("synthetic", "")).lower() in ("yes", "true", "1")]
+        if synth:
+            text += f"; synthetic: {', '.join(synth)}"
+        ev = [r.get("source_id") or "?" for r in rs if (r.get("role") or "").startswith("eval_only")]
+        if ev:
+            text += f"; evaluation only (never trained on): {', '.join(ev)}"
+        flagged = [r.get("source_id") or "?" for r in rs
+                   if (r.get("training_policy") or "allowed") != "allowed" and _int(r.get("student_train_n")) > 0]
+        if flagged:
+            text += f"; trained on sources not cleared by license policy: {', '.join(flagged)}"
+        parts.append(text)
+    return ". ".join(parts)
 
 
 def build_workbook(results_path: Path | list[Path], out_path: Path, model_meta: dict | None = None,
-                   cmds_json: str = "auto") -> dict:
+                   cmds_json: str = "auto", training_sources: Path | None = None,
+                   supplements: list[Path] | None = None) -> dict:
     """Write the workbook from one results JSONL or several (merged by
     record id, the last one wins; see merge_results). Streamed: rows are
     read one at a time by offset and written with openpyxl's write-only
     mode, so 30,000 records need little memory. ``cmds_json``: embed (the
     two CMDS documents as text), paths (their file paths and validity), or
-    auto (embed up to EMBED_CMDS_MAX_ROWS records). Returns simple stats."""
+    auto (embed up to EMBED_CMDS_MAX_ROWS records). ``training_sources``: a
+    CSV of the model's training and evaluation sources (see
+    load_training_sources), copied to the Model_Training_Datasets sheet and
+    summarised in the README. Returns simple stats."""
+    training = load_training_sources(Path(training_sources)) if training_sources else None
     from openpyxl import Workbook
     from openpyxl.cell import WriteOnlyCell
     from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
@@ -490,21 +672,24 @@ def build_workbook(results_path: Path | list[Path], out_path: Path, model_meta: 
     from openpyxl.utils import get_column_letter
 
     paths = [Path(p) for p in results_path] if isinstance(results_path, (list, tuple)) else [Path(results_path)]
+    supp = load_supplements([Path(p) for p in supplements or []])
     index = merge_index(paths)
     order = sorted(index, key=lambda r: (0, int(r)) if str(r).isdigit() else (1, 0))
     embed = cmds_json == "embed" or (cmds_json == "auto" and len(order) <= EMBED_CMDS_MAX_ROWS)
 
     # ---- pass 1: statistics, column widths (first 300 rows), format totals
     stats = {"n": len(order), "status": Counter(), "passes": Counter(), "n_classified": 0, "n_eye": 0,
-             "n_mask_dominated": 0, "n_kept": 0, "kept_bytes": 0, "first": {}, "n_cmds": 0, "n_dirs": 0}
+             "n_mask_dominated": 0, "n_kept": 0, "kept_bytes": 0, "first": {}, "n_cmds": 0, "n_dirs": 0,
+             "n_supplement": len(supp), "n_supplement_matched": 0}
     prov_counts: dict[tuple[str, str], Counter] = defaultdict(Counter)
     fmt = {k: (Counter(), Counter()) for k in ("formats_classified", "formats_unread", "conversion_counts")}
     counts = {"weblinks": 0, "record_classes": 0, "archive_probes": 0}
     widths: dict[str, dict[str, int]] = defaultdict(dict)
-    for i, r in enumerate(_iter_rows(paths, index, order)):
+    for i, r in enumerate(_iter_rows(paths, index, order, supp)):
         if i == 0:
             stats["first"] = {k: v for k, v in r.items() if not isinstance(v, (list, dict))}
         stats["status"][r.get("status")] += 1
+        stats["n_supplement_matched"] += r["record_id"] in supp
         stats["passes"][r.get("sampling_pass") or "(none)"] += 1
         stats["n_classified"] += (r.get("n_classified") or 0) > 0
         stats["n_eye"] += bool(r.get("present_eye_classes"))
@@ -574,7 +759,7 @@ def build_workbook(results_path: Path | list[Path], out_path: Path, model_meta: 
     ws = wb.create_sheet("README")
     ws.column_dimensions["A"].width = 32
     ws.column_dimensions["B"].width = 120
-    for i, (k, v) in enumerate(_readme_rows(stats, paths, model_meta)):
+    for i, (k, v) in enumerate(_readme_rows(stats, paths, model_meta, training)):
         a = WriteOnlyCell(ws, value=clean(k))
         a.font = Font(bold=True, size=14) if i == 0 else Font(bold=True)
         b = WriteOnlyCell(ws, value=clean(v))
@@ -611,7 +796,7 @@ def build_workbook(results_path: Path | list[Path], out_path: Path, model_meta: 
                    ("dsd_bytes", "dataset_structure_description.json bytes")]
     cmds_sheet = None                   # created after the reference sheets (sheet order kept below)
     cj_pending: list[dict] = []
-    for r in _iter_rows(paths, index, order):
+    for r in _iter_rows(paths, index, order, supp):
         records.add(r)
         detail = r.get("_class_detail") or {}
         per_class = r.get("dicom_per_class") or {}
@@ -725,16 +910,37 @@ def build_workbook(results_path: Path | list[Path], out_path: Path, model_meta: 
     for d in fo_rows:
         fot.add(d)
 
+    # ---- Model_Training_Datasets: the classifier's sources, as given
+    if training is not None:
+        t_cols, t_rows = training
+        tt = Table(TRAINING_SHEET, [(c, c) for c in t_cols], len(t_rows), freeze="C2", link_cols=("url",))
+        for d in t_rows:
+            tt.add({k: (_int(v) if k.endswith("_n") and str(v).strip().lstrip("-").isdigit() else v)
+                    for k, v in d.items() if k})
+
+    # ---- Access_Requests (enrich-access supplements only)
+    n_access = 0
+    if supp:
+        ar_rows = access_request_rows(supp)
+        n_access = len(ar_rows)
+        art = Table("Access_Requests", ACCESS_REQUEST_COLUMNS, n_access, freeze="D2", link_cols=("url",))
+        for d in ar_rows:
+            art.add(d)
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_name(out_path.name + ".tmp.xlsx")
     wb.save(tmp)
     tmp.replace(out_path)
     return {"records": stats["n"], "weblinks": counts["weblinks"], "record_classes": counts["record_classes"],
             "archive_probes": counts["archive_probes"], "cmds_json": "embedded" if embed else "paths",
+            "supplement_rows": stats["n_supplement"], "supplement_rows_matched": stats["n_supplement_matched"],
+            "access_requests": n_access,
+            "training_sources": len(training[1]) if training is not None else None,
             "status": dict(stats["status"]), "path": str(out_path)}
 
 
-def _readme_rows(stats: dict, paths: list[Path], model_meta: dict | None) -> list[tuple]:
+def _readme_rows(stats: dict, paths: list[Path], model_meta: dict | None,
+                 training: tuple[list[str], list[dict]] | None = None) -> list[tuple]:
     status = stats["status"]
     first = stats["first"]
     model_meta = model_meta or {}
@@ -901,6 +1107,11 @@ def _readme_rows(stats: dict, paths: list[Path], model_meta: dict | None) -> lis
                                "run started)") if first.get("model_onnx_sha256")
          else (model_meta.get("onnx_sha256") or "")),
         ("Model ONNX parity", _parity_text(model_meta)),
+        ("Model training datasets",
+         (f"See the {TRAINING_SHEET} sheet: one row per model version, source and class, with license, "
+          "role (train, held-out test source, within-source holdout, synthetic, evaluation only) and image "
+          "counts, as supplied by the model's maintainers. " + training_summary(training[1]))
+         if training is not None else "not included (pass --training-sources)"),
         ("Estimated file counts", "CMDS numberOfFiles per modality = total image files x class fraction in the "
                                   "sample (exact when every image was classified)."),
         ("DICOM", "DICOM-aligned attributes, not DICOM conformance. dicom_mapping_status: read_from_header = "
