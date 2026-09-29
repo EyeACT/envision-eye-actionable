@@ -81,6 +81,42 @@ from .zenodo import ZenodoClient, load_scrape, load_token, record_files, redact
 PRODUCER_GONE_CHECKS = 3        # consumer: producer absent this many polls in a row -> drain and stop
 STATUS_EVERY_S = 15.0
 EXIT_CONSUMER_GONE = 3
+# A role whose own memory (resident plus swapped out) grew over
+# --role-recycle-gb exits with this code between records and the pipeline
+# starts it again at once as a clean restart. Python keeps freed heap for
+# itself: after days of work the fetch role held 8 GB (7 GB of it in swap)
+# and the process role was OOM-killed on the next large record.
+EXIT_RECYCLE = 75
+MEMORY_CHECK_S = 30.0           # fetch: seconds between two memory checks
+
+
+def role_memory_bytes() -> int | None:
+    """Resident plus swapped-out memory of this process (Linux
+    /proc/self/status VmRSS + VmSwap), or None where that is not available."""
+    try:
+        text = Path("/proc/self/status").read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return None
+    total, found = 0, False
+    for line in text.splitlines():
+        if line.startswith(("VmRSS:", "VmSwap:")):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                total += int(parts[1]) * 1024
+                found = True
+    return total if found else None
+
+
+def over_recycle_limit(cfg, measure=None) -> int | None:
+    """This role's memory in bytes when it is over --role-recycle-gb (0 or
+    None: never), else None."""
+    limit = float(getattr(cfg, "role_recycle_gb", 0) or 0)
+    if limit <= 0:
+        return None
+    used = (measure or role_memory_bytes)()
+    if used is None or used <= limit * 1e9:
+        return None
+    return used
 MAX_REFETCHES = 2               # consumer: a record whose spool fails validation this often gets an error row
 
 
@@ -366,6 +402,8 @@ class Producer:
         self._tail_lock = threading.Lock()
         self._last_repair = 0.0
         self.stop_reason = ""
+        self.recycle = False                          # stop_reason is a memory recycle (EXIT_RECYCLE)
+        self._last_mem_check = 0.0
 
     # -- hooks
     def _event(self, ev: dict):
@@ -596,8 +634,14 @@ class Producer:
         # again so that their files reach the keep dir; the new row replaces
         # the old one (last line wins). Rows written with retention are not
         # redone, so the option is safe to leave on across restarts.
-        refetch = {str(i) for i in (getattr(cfg, "refetch_ids", None) or [])}
-        refetch = {rid for rid in refetch if is_final(done.get(rid)) and "kept" not in (done.get(rid) or {})}
+        # Rows refused for room (keep.refused_for_room: kept = false by the
+        # keep dir cap or the disk guard) are redone too, so that a raised
+        # --keep-max-gb keeps them; such a row that is refused again is
+        # redone at each producer start while its id stays in the file.
+        from .keep import refused_for_room
+        refetch_order = [str(i) for i in (getattr(cfg, "refetch_ids", None) or [])]
+        refetch = {rid for rid in refetch_order if is_final(done.get(rid))
+                   and ("kept" not in (done.get(rid) or {}) or refused_for_room(done.get(rid)))}
         todo = [r for r in scope if not is_final(done.get(r["source_id"]), cfg.retry_statuses)
                 or r["source_id"] in refetch]
         # records a previous producer left ready, awaiting_deep or deep_ready
@@ -612,8 +656,11 @@ class Producer:
         self._repair_requests()
         todo = order_records(todo, cfg, self.zenodo)
         if refetch:
-            # the backfill goes first (cheapest first among it)
-            todo = [r for r in todo if r["source_id"] in refetch] + [r for r in todo if r["source_id"] not in refetch]
+            # the backfill goes first, in the order of the ids file
+            # (keep-backfill-ids --include-refused: most eye images first)
+            rank = {rid: i for i, rid in enumerate(refetch_order)}
+            todo = (sorted((r for r in todo if r["source_id"] in refetch), key=lambda r: rank[r["source_id"]])
+                    + [r for r in todo if r["source_id"] not in refetch])
         if cfg.limit is not None:
             todo = todo[: cfg.limit]
         self.status.update(state="running", n_scope=len(scope), n_todo=len(todo), order=cfg.order,
@@ -630,6 +677,14 @@ class Producer:
             while True:
                 while self._yielded:                  # back to the front, in their order
                     queue.appendleft(self._yielded.pop())
+                if not self.stop_reason and time.monotonic() - self._last_mem_check > MEMORY_CHECK_S:
+                    self._last_mem_check = time.monotonic()
+                    used = over_recycle_limit(cfg)
+                    if used is not None:
+                        # no new jobs; the running ones finish, then a clean restart
+                        self.recycle = True
+                        self.stop_reason = (f"memory recycle: {used / 1e9:.1f} GB over --role-recycle-gb "
+                                            f"{cfg.role_recycle_gb:g}")
                 if time.monotonic() - self._last_repair > max(30.0, 20 * cfg.poll_s):
                     self._last_repair = time.monotonic()
                     self._repair_requests()
@@ -667,7 +722,7 @@ class Producer:
                 if self.stop_reason:
                     print(f"[fetch] stopping: {self.stop_reason}", flush=True)
                     self._event({"event": "fetch_stop", "reason": self.stop_reason})
-                    return EXIT_CONSUMER_GONE
+                    return EXIT_RECYCLE if self.recycle else EXIT_CONSUMER_GONE
                 # queue empty, nothing in flight, no request: wait while the
                 # consumer may still ask for deep passes
                 self._repair_requests()
@@ -842,6 +897,13 @@ class Processor:
                 n_done += out == "row"
                 self.status.count(out)
                 self.status.update(rate_per_h=round(n_done / max(1e-6, time.time() - t0) * 3600, 1))
+                used = over_recycle_limit(cfg)
+                if used is not None:
+                    msg = f"memory recycle: {used / 1e9:.1f} GB over --role-recycle-gb {cfg.role_recycle_gb:g}"
+                    print(f"[process] stopping: {msg}", flush=True)
+                    self.survey_event({"event": "process_stop", "reason": msg})
+                    self._stop = True
+                    return EXIT_RECYCLE
 
     def survey_event(self, ev: dict):
         from .runner import _log_event
@@ -1324,13 +1386,15 @@ def run_pipeline(cfg, passthrough: list[str], interval: float, base_cmd: list[st
                 d["ended"] = _now()
                 d["log"].close()
                 ev = {"event": "role_exited", "role": role, "exit_code": d["exit_code"]}
-                if d["exit_code"] != 0 and role != "monitor":
+                if d["exit_code"] not in (0, EXIT_RECYCLE) and role != "monitor":
                     ev["event"] = "role_crashed"
                     crashes[role] += 1
                 _append_jsonl(events, ev)
                 if role == "monitor" or stopping["flag"]:
                     continue
-                if d["exit_code"] != 0:
+                if d["exit_code"] == EXIT_RECYCLE:
+                    schedule(role, "recycled (memory over --role-recycle-gb)", clean=True)
+                elif d["exit_code"] != 0:
                     if role == "fetch" and "process" in given_up:
                         given_up.add("fetch")         # nothing would ever consume what it fetches
                         _append_jsonl(events, {"event": "role_given_up", "role": "fetch",
@@ -1380,7 +1444,7 @@ def run_pipeline(cfg, passthrough: list[str], interval: float, base_cmd: list[st
                 Monitor(cfg).run(interval, once=True)
             except Exception:  # noqa: BLE001 - the final snapshot is best effort
                 pass
-            failed = bool(given_up) or any(procs[r]["exit_code"] != 0 for r in ("fetch", "process"))
+            failed = bool(given_up) or any(procs[r]["exit_code"] not in (0, EXIT_RECYCLE) for r in ("fetch", "process"))
             write_status(finished=True, extra=("stopped by signal" if stopping["flag"]
                                                else ("failed" if failed else "done")))
             _append_jsonl(events, {"event": "pipeline_end", "crashes": dict(crashes), "restarts": dict(restarts),

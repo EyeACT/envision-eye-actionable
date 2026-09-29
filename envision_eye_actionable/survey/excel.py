@@ -6,6 +6,10 @@ Sheets:
     Record_Classes  one row per (record, present modality) with its DICOM mapping
     Weblinks        external links of records with no usable image files
     Archive_Probes  one row per archive probed before a download
+    Review_Likely_FP
+                    review list: ok records whose only eye classes are OCTA
+                    and/or PSC and whose SetFit label is NEGATIVE or whose
+                    eye image fraction is under 0.5 (likely false positives)
     DICOM_Mapping   reference: classifier class -> DICOM attributes and CMDS dirs
     Schema_Fields   which AI-READI / CMDS fields were filled from what
     CMDS_JSON       the two CMDS JSON documents of every record, as text (or,
@@ -118,6 +122,7 @@ RECORD_COLUMNS: list[tuple[str, str]] = [
     ("eye_image_fraction", "Eye image fraction (of non-mask images; status ok needs >= --min-eye-fraction)"),
     ("modality_low_trust", "Eye modality low trust (review)"),
     ("modality_review_flags", "Eye modality review flags"),
+    ("review_likely_false_positive", "Likely false positive (review list): why"),
     ("mean_confidence", "Mean top-1 confidence"),
     *[(f"n_{c}", f"n {c}") for c in CLASSES + [UNCERTAIN, MASK]],
     *[(f"argmax_{c}", f"argmax n {c}") for c in CLASSES + [MASK]],
@@ -372,6 +377,44 @@ def _human(n) -> str:
     return f"{int(n)} B"
 
 
+# Review list of likely false positives: an ok record whose only eye classes
+# are OCTA and/or PSC (the classes non-eye grayscale images and graphics fall
+# into most often) AND whose metadata says not eye imaging (discovery SetFit
+# label NEGATIVE) or whose eye images are under half of its non-mask images.
+REVIEW_FP_CLASSES = frozenset({"OCTA", "PSC"})
+REVIEW_FP_MAX_EYE_FRACTION = 0.5
+REVIEW_FP_STATUSES = ("ok", "ok_partial_download")
+REVIEW_FP_SHEET = "Review_Likely_FP"
+REVIEW_FP_COLUMNS = [
+    ("record_id", "Zenodo record id"), ("title", "Title"), ("url", "Landing page"), ("status", "Survey status"),
+    ("review_likely_false_positive", "Why it is on the list"),
+    ("present_eye_classes", "Eye modalities present"), ("dominant_class", "Dominant class"),
+    ("eye_image_fraction", "Eye image fraction (non-mask)"), ("n_classified", "Images classified"),
+    ("n_OCTA", "n OCTA"), ("n_PSC", "n PSC"), ("n_NEG", "n NEG"), ("mean_confidence", "Mean top-1 confidence"),
+    ("setfit_label", "Discovery SetFit label"), ("setfit_prob_eye_imaging", "Discovery SetFit p(eye imaging)"),
+    ("modality_review_flags", "Eye modality review flags"), ("license", "License"), ("kept", "Files kept"),
+]
+
+
+def likely_false_positive(row: dict) -> str:
+    """Why ``row`` is on the review list of likely false positives, or ""
+    (see REVIEW_FP_CLASSES). Nothing is removed: the list is for review."""
+    if row.get("status") not in REVIEW_FP_STATUSES:
+        return ""
+    present = {c for c in str(row.get("present_eye_classes") or "").split(", ") if c}
+    if not present or not present <= REVIEW_FP_CLASSES:
+        return ""
+    why = []
+    if str(row.get("setfit_label") or "").upper() == "NEGATIVE":
+        why.append("discovery SetFit label NEGATIVE")
+    ef = row.get("eye_image_fraction")
+    if isinstance(ef, (int, float)) and ef < REVIEW_FP_MAX_EYE_FRACTION:
+        why.append(f"eye image fraction {ef:.2f} < {REVIEW_FP_MAX_EYE_FRACTION:g}")
+    if not why:
+        return ""
+    return f"only {' + '.join(sorted(present))}; " + "; ".join(why)
+
+
 def backfill(row: dict) -> dict:
     """Columns added after a row was written (older JSONL lines): argmax
     fractions from the argmax counts, the IR device fields, the eye modality
@@ -392,6 +435,7 @@ def backfill(row: dict) -> dict:
         row["sampling_mode"] = row["sampling_mode"].strip("+") or "none"
     if "n_images_listed" not in row and "n_image_files" in row:
         row["n_images_listed"] = row["n_image_files"]
+    row["review_likely_false_positive"] = likely_false_positive(row)
     return row
 
 
@@ -680,6 +724,7 @@ def build_workbook(results_path: Path | list[Path], out_path: Path, model_meta: 
     # ---- pass 1: statistics, column widths (first 300 rows), format totals
     stats = {"n": len(order), "status": Counter(), "passes": Counter(), "n_classified": 0, "n_eye": 0,
              "n_mask_dominated": 0, "n_kept": 0, "kept_bytes": 0, "first": {}, "n_cmds": 0, "n_dirs": 0,
+             "n_review_fp": 0,
              "n_supplement": len(supp), "n_supplement_matched": 0}
     prov_counts: dict[tuple[str, str], Counter] = defaultdict(Counter)
     fmt = {k: (Counter(), Counter()) for k in ("formats_classified", "formats_unread", "conversion_counts")}
@@ -695,6 +740,7 @@ def build_workbook(results_path: Path | list[Path], out_path: Path, model_meta: 
         stats["n_eye"] += bool(r.get("present_eye_classes"))
         stats["n_mask_dominated"] += bool(r.get("mask_dominated"))
         stats["n_kept"] += bool(r.get("kept"))
+        stats["n_review_fp"] += bool(r.get("review_likely_false_positive"))
         stats["kept_bytes"] += int(r.get("kept_bytes") or 0) if r.get("kept") else 0
         stats["n_cmds"] += bool(r.get("cmds_dir"))
         stats["n_dirs"] += bool(r.get("cmds_directories"))
@@ -782,6 +828,7 @@ def build_workbook(results_path: Path | list[Path], out_path: Path, model_meta: 
     rclasses = Table("Record_Classes", rc_cols, counts["record_classes"], freeze="D2")
     weblinks = Table("Weblinks", WEBLINK_COLUMNS, counts["weblinks"], freeze="D2", link_cols=("url", "final_url"))
     probes = Table("Archive_Probes", ARCHIVE_PROBE_COLUMNS, counts["archive_probes"], freeze="C2")
+    review_fp = Table(REVIEW_FP_SHEET, REVIEW_FP_COLUMNS, stats["n_review_fp"], freeze="C2")
     if embed:
         cj_cols = [("record_id", "Zenodo record id"), ("cmds_folder", "CMDS JSON folder (results dir + cmds/<id>)"),
                    ("dd_valid", "dataset_description valid"), ("dsd_valid", "dataset_structure_description valid"),
@@ -798,6 +845,8 @@ def build_workbook(results_path: Path | list[Path], out_path: Path, model_meta: 
     cj_pending: list[dict] = []
     for r in _iter_rows(paths, index, order, supp):
         records.add(r)
+        if r.get("review_likely_false_positive"):
+            review_fp.add(r)
         detail = r.get("_class_detail") or {}
         per_class = r.get("dicom_per_class") or {}
         for cls, info in detail.items():
@@ -934,7 +983,7 @@ def build_workbook(results_path: Path | list[Path], out_path: Path, model_meta: 
     return {"records": stats["n"], "weblinks": counts["weblinks"], "record_classes": counts["record_classes"],
             "archive_probes": counts["archive_probes"], "cmds_json": "embedded" if embed else "paths",
             "supplement_rows": stats["n_supplement"], "supplement_rows_matched": stats["n_supplement_matched"],
-            "access_requests": n_access,
+            "access_requests": n_access, "review_likely_fp": stats["n_review_fp"],
             "training_sources": len(training[1]) if training is not None else None,
             "status": dict(stats["status"]), "path": str(out_path)}
 
@@ -953,6 +1002,9 @@ def _readme_rows(stats: dict, paths: list[Path], model_meta: dict | None,
         ("Records with classified images", stats["n_classified"]),
         ("Records with an eye modality", stats["n_eye"]),
         ("Records mask-dominated (eye classes review only)", stats["n_mask_dominated"]),
+        (f"Records on the {REVIEW_FP_SHEET} review list", f"{stats['n_review_fp']} (status ok, only OCTA and/or PSC "
+         f"as eye classes, and discovery SetFit label NEGATIVE or eye image fraction under "
+         f"{REVIEW_FP_MAX_EYE_FRACTION:g}; listed for a human check, nothing removed)"),
         ("Records whose fetched files were kept (keep dir)", stats["n_kept"]),
         ("Bytes kept", _human(stats["kept_bytes"])),
         ("", ""),

@@ -43,7 +43,8 @@ def load_statuses(path: Path) -> dict[str, dict]:
     """As load_results, but each record keeps only its status (the fetch
     role reads a results file of 30,000 large rows at start) and, when the
     row has one, its ``kept`` field (keep dir retention; its absence marks a
-    row written before retention existed)."""
+    row written before retention existed) and, for kept = false, the start
+    of its ``kept_reason``."""
     out: dict[str, dict] = {}
     if not Path(path).exists():
         return out
@@ -60,5 +61,7 @@ def load_statuses(path: Path) -> dict[str, dict]:
                 d = {"status": row.get("status")}
                 if "kept" in row:
                     d["kept"] = row["kept"]
+                    if row["kept"] is False and row.get("kept_reason"):
+                        d["kept_reason"] = str(row["kept_reason"])[:40]
                 out[str(row["record_id"])] = d
     return out

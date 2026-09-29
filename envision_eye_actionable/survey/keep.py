@@ -69,6 +69,15 @@ MARKER_FILES = {READY, AWAITING_DEEP, DEEP_READY, RETURNED, ATTEMPTS, KEPT}
 SCRATCH_DIRS = {"work", ".fetchwalk"}
 META_FILES = {MANIFEST, MANIFEST_DEEP, LISTINGS}
 MAX_LOCAL_IN_ROW = 20
+# kept_reason prefixes of an eye-positive record refused for room only (the
+# keep dir cap or the disk guard): such a record can be kept later, with a
+# higher --keep-max-gb, through --refetch-keep-ids
+ROOM_REASONS = ("--keep-max-gb", "disk:")
+
+
+def refused_for_room(row: dict | None) -> bool:
+    """True when ``row`` says kept = false for lack of room (ROOM_REASONS)."""
+    return bool(row) and row.get("kept") is False and str(row.get("kept_reason") or "").startswith(ROOM_REASONS)
 
 
 def _rename(src: Path, dst: Path):
@@ -361,16 +370,25 @@ def _pred_eye_count(path: Path) -> int | None:
 
 
 def backfill_ids(results_path: Path, predictions_dir: Path | None = None,
-                 keep_dir: Path | None = None) -> tuple[list[str], dict]:
+                 keep_dir: Path | None = None, include_refused: bool = False,
+                 budget_bytes: float | None = None) -> tuple[list[str], dict]:
     """Record ids whose last final row was written before retention (no
     ``kept`` field) and holds at least one eye image, by the row's n_<eye
     class> counts or by its predictions file (either suffices). Left out:
     ids that already have a KEPT.json in ``keep_dir``, and rows of the
     pipeline with spool_bytes 0 (only local originals, read in place:
     nothing was fetched, so nothing was deleted). Streams the results file
-    (only a few fields per record stay in memory)."""
+    (only a few fields per record stay in memory).
+
+    ``include_refused``: also the eye-positive rows refused for room
+    (refused_for_room: the keep dir cap or the disk guard), and the ids come
+    most eye images first (ties: fewer bytes first). ``budget_bytes``: the
+    ids are then chosen in that order while their spool_bytes (what the
+    record fetched) still fit in the budget; the rest are listed in the
+    summary (``left_out``)."""
     from .results import is_final
     last: dict[str, tuple] = {}          # rid -> (final, has_kept, n_eye, n_classified, nothing fetched)
+    refused: dict[str, tuple[int, int]] = {}     # rid -> (n_eye, spool_bytes) of a row refused for room
     with open(results_path, encoding="utf-8") as fp:
         for line in fp:
             line = line.strip()
@@ -385,6 +403,13 @@ def backfill_ids(results_path: Path, predictions_dir: Path | None = None,
                 continue
             last[rid] = (is_final(row), "kept" in row, n_eye_images(row), int(row.get("n_classified") or 0),
                          "spool_bytes" in row and not row.get("spool_bytes"))
+            if not is_final(row):
+                continue                 # started / awaiting_deep lines do not replace the last final row
+            refused.pop(rid, None)
+            if include_refused and refused_for_room(row) and int(row.get("spool_bytes") or 0) > 0:
+                n = int(row.get("n_eye_images") or 0) or n_eye_images(row)
+                if n > 0:
+                    refused[rid] = (n, int(row.get("spool_bytes") or 0))
     by_rows, by_preds, local_only = set(), set(), set()
     n_pre = 0
     for rid, (final, has_kept, n_eye, n_cls, nothing_fetched) in last.items():
@@ -402,14 +427,42 @@ def backfill_ids(results_path: Path, predictions_dir: Path | None = None,
             if n:
                 by_preds.add(rid)
     ids = by_rows | by_preds
+    pre_ids = set(ids)
+    ids |= set(refused)
     already = set()
     if keep_dir is not None:
         already = {rid for rid in ids if (Path(keep_dir) / rid / KEPT).is_file()}
         ids -= already
-    out = sorted(ids, key=lambda r: (len(r), r))
     summary = {"records_with_rows": len(last), "final_rows_before_retention": n_pre,
                "eye_by_rows": len(by_rows), "eye_by_predictions": len(by_preds),
                "rows_only": sorted(by_rows - by_preds)[:50], "predictions_only": sorted(by_preds - by_rows)[:50],
-               "already_kept": len(already), "eye_local_only_not_listed": sorted(local_only)[:50],
-               "ids": len(out)}
+               "already_kept": len(already), "eye_local_only_not_listed": sorted(local_only)[:50]}
+    if not include_refused:
+        out = sorted(ids, key=lambda r: (len(r), r))
+        summary["ids"] = len(out)
+        return out, summary
+
+    def n_eye(rid):
+        return refused[rid][0] if rid in refused else 0
+
+    def nbytes(rid):
+        return refused[rid][1] if rid in refused else 0
+    # rows before retention first (their eye counts may come from the
+    # predictions only), then the refused ones, most eye images first
+    order = sorted(ids, key=lambda r: (r not in pre_ids, -n_eye(r), nbytes(r), len(r), r))
+    out, left_out, used = [], [], 0
+    for rid in order:
+        if budget_bytes is not None and used + nbytes(rid) > budget_bytes:
+            left_out.append(rid)
+            continue
+        out.append(rid)
+        used += nbytes(rid)
+    summary.update({
+        "refused_for_room": len(refused), "ids": len(out), "selected_bytes_gb": round(used / 1e9, 2),
+        "selected_eye_images": sum(n_eye(r) for r in out),
+        "budget_gb": None if budget_bytes is None else round(budget_bytes / 1e9, 2),
+        "left_out": len(left_out), "left_out_bytes_gb": round(sum(nbytes(r) for r in left_out) / 1e9, 2),
+        "left_out_eye_images": sum(n_eye(r) for r in left_out),
+        "left_out_ids": [{"record_id": r, "n_eye_images": n_eye(r), "spool_gb": round(nbytes(r) / 1e9, 2)}
+                         for r in left_out]})
     return out, summary

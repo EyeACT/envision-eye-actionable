@@ -995,8 +995,8 @@ def test_streamed_workbook_formats_sheet_and_cmds_paths(tmp_path, monkeypatch):
     stats = excel.build_workbook(res, out / "w.xlsx")
     assert stats["records"] == 5 and stats["cmds_json"] == "paths"
     wb = load_workbook(out / "w.xlsx", read_only=True)
-    assert wb.sheetnames == ["README", "Records", "Record_Classes", "Weblinks", "Archive_Probes", "DICOM_Mapping",
-                             "Schema_Fields", "CMDS_JSON", "Formats"]
+    assert wb.sheetnames == ["README", "Records", "Record_Classes", "Weblinks", "Archive_Probes", "Review_Likely_FP",
+                             "DICOM_Mapping", "Schema_Fields", "CMDS_JSON", "Formats"]
     head = [c.value for c in next(wb["Records"].iter_rows(max_row=1))]
     assert any("NOT used to select" in (h or "") for h in head)
     recs = {r[0]: r for r in wb["Records"].iter_rows(min_row=2, values_only=True)}

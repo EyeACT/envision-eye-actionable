@@ -76,6 +76,7 @@ import requests
 
 from .constants import (IMAGE_KINDS, RAR_EXTS, SEVEN_ZIP_EXTS, SNIFF_BYTES, TAR_EXTS, ZIP_EXTS, detect_ext,
                         file_kind, is_fragment, nested_worth, sniff_kind, split_first, split_stem)
+from .archives import iter_tar_stream
 from .remote import HttpRangeFile, file_url, is_junk_member
 from .zenodo import RemoteError, ZenodoClient
 
@@ -327,6 +328,7 @@ def _probe_tar(client, url, res: ProbeResult, stream_bytes: int, max_requests: i
                 if m is None:
                     res.complete = True
                     break
+                tf.members.clear()              # memory: see archives.iter_tar_stream
                 if not m.isfile():
                     continue
                 head = None
@@ -363,7 +365,7 @@ def _probe_tar_stream(client, url, res: ProbeResult, stream_bytes: int):
         else:
             opened = tarfile.open(fileobj=stream, mode="r|*")
         with opened as tf:
-            for m in tf:
+            for m in iter_tar_stream(tf):
                 if not m.isfile():
                     continue
                 head = None

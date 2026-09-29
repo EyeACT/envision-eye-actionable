@@ -219,6 +219,10 @@ def _add_common(p):
     g.add_argument("--restart-backoff-s", type=float, default=10.0,
                    help="pipeline: delay before the first restart of a role, doubled per restart, at most "
                         "300 s (default 10)")
+    g.add_argument("--role-recycle-gb", type=float, default=4.0,
+                   help="fetch and process: when the role's own memory (resident plus swap) is over this, it "
+                        "exits between records and the pipeline starts it again as a clean restart; Python "
+                        "keeps freed memory, so a role running for days grows (default 4, 0 = never)")
     g.add_argument("--interval", type=float, default=60.0, help="monitor: seconds between snapshots (default 60)")
     g.add_argument("--once", action="store_true", help="monitor: one snapshot, then exit")
     g.add_argument("--exit-when-idle", action="store_true",
@@ -285,6 +289,12 @@ def _add_keep_backfill(sub):
                                                                 "predictions/)")
     p.add_argument("--keep-dir", type=Path, default=None, help="leave out ids already kept there (KEPT.json)")
     p.add_argument("--output", type=Path, required=True, help="where the ids go, one per line")
+    p.add_argument("--include-refused", action="store_true",
+                   help="also eye-positive records refused for room (kept = false by --keep-max-gb or the disk "
+                        "guard), most eye images first")
+    p.add_argument("--budget-gb", type=float, default=None,
+                   help="with --include-refused: choose ids in that order while their fetched bytes fit in this "
+                        "many GB; the rest are listed in the summary")
 
 
 def _add_enrich_access(sub):
@@ -373,7 +383,9 @@ def main(argv: list[str] | None = None) -> int:
         res = args.out_dir / "survey_results.jsonl"
         if not res.is_file():
             parser.error(f"no {res}")
-        ids, summary = backfill_ids(res, args.out_dir / "predictions", args.keep_dir)
+        ids, summary = backfill_ids(res, args.out_dir / "predictions", args.keep_dir,
+                                    include_refused=args.include_refused,
+                                    budget_bytes=args.budget_gb * 1e9 if args.budget_gb is not None else None)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         tmp = args.output.with_name(args.output.name + ".tmp")
         tmp.write_text("".join(i + "\n" for i in ids), encoding="utf-8")
@@ -479,6 +491,7 @@ def main(argv: list[str] | None = None) -> int:
         spool_max_gb=args.spool_max_gb, fetch_workers=args.fetch_workers, poll_s=args.poll_s,
         order=args.order, max_attempts=args.max_attempts, consumer_grace_s=args.consumer_grace_s,
         max_role_restarts=args.max_role_restarts, restart_backoff_s=args.restart_backoff_s,
+        role_recycle_gb=args.role_recycle_gb,
         keep_dir=args.keep_dir, keep_max_gb=args.keep_max_gb, refetch_ids=refetch_ids,
     )
     if args.cmd == "run":

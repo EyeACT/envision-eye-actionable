@@ -109,6 +109,7 @@ RESULTS_NAME = "survey_results.jsonl"
 EVENTS_NAME = "survey_events.jsonl"
 SCRATCH_MARKER = ".envision_survey_scratch"
 SCRATCH_RECORDS = "records"
+REMOTE_ENTRY_ROOM = 50_000        # walker entries kept for remote members over the local ones
 
 
 @dataclass
@@ -163,6 +164,7 @@ class SurveyConfig:
     consumer_grace_s: float = 600.0        # producer stops when the consumer is gone this long and it must wait
     max_role_restarts: int = 20            # pipeline: restarts of fetch or process (each) before it gives up
     restart_backoff_s: float = 10.0        # pipeline: first restart delay, doubled per restart, at most 300 s
+    role_recycle_gb: float = 4.0           # fetch / process: clean restart when own RSS + swap exceeds this (0: never)
     keep_dir: Path | None = None           # process: fetched files of records with an eye image are moved here
     keep_max_gb: float = 200.0             # keep dir size cap (0: none); past it records are not kept (kept false)
     refetch_ids: list[str] = field(default_factory=list)   # fetch: redo these finished pre-retention records
@@ -520,7 +522,7 @@ class Survey:
                 for e in walker.entries[n0:]:
                     entry_pass[id(e)] = item_pass.get(str(p), "triage")
             n_probe_negative = self._add_probe_listings(walker, m.get("probe_negative"))
-            n_seen = len(walker.entries) + len(unfetched_top)     # images seen in listings
+            n_seen = walker.n_images_seen + len(unfetched_top)    # images seen in listings
             n_est = float(n_seen)                                 # population estimate
             n_file_entries = len(walker.entries)
             # Sampling strata: local and downloaded files, remote zip
@@ -546,6 +548,10 @@ class Survey:
             row["member_ext_counts"] = dict(member_ext.most_common(25))
             row["n_archives_listed"] = (len(walker.containers) + int(row.get("n_files_remote_zip") or 0)
                                         + n_probe_negative)
+            row["n_images_over_entry_cap"] = walker.n_entries_over_cap
+            if walker.n_entries_over_cap:
+                walker.errors.append(f"{walker.n_images_seen} images listed; the sample was drawn from the first "
+                                     f"{len(walker.entries)} in listing order (memory cap)")
             row["walk_errors"] = len(walker.errors)
             row["walk_error_detail"] = redact("; ".join(walker.errors[:5]))[:1000]
 
@@ -713,11 +719,15 @@ class Survey:
         nested_ids: set[int] = set()
         n_direct_items = 0
         added = 0
+        # the remote strata get their own room under the walker's entry cap
+        # (local listings may have used all of it)
+        walker.max_entries = max(walker.max_entries, len(walker.entries) + REMOTE_ENTRY_ROOM)
         for it in items:
             if it.get("role") not in ("remote", "remote_nested"):
                 continue
             path = rdir / it["path"]
             n0 = len(walker.entries)
+            seen0 = walker.n_images_seen
             walker.add_file(path, it["key"])
             for e in walker.entries[n0:]:
                 entry_pass[id(e)] = it.get("pass") or "triage"
@@ -725,7 +735,7 @@ class Survey:
                     nested_ids.add(id(e))
             if it["role"] == "remote":
                 n_direct_items += 1
-                added += len(walker.entries) - n0
+                added += walker.n_images_seen - seen0
         entry_stratum = {id(e): ("remote_nested" if id(e) in nested_ids else "remote")
                          for e in walker.entries[first_entry:]}
         walker.kind_counts.update(rs.get("member_kind_counts") or {})
@@ -1154,7 +1164,7 @@ class Survey:
 
     def _finish_without_images(self, row, rec, legacy, datacite, walker: RecordWalker | None = None):
         """No usable images: DICOM status n/a, CMDS docs, weblink catalogue."""
-        row.setdefault("n_image_files", len(walker.entries) if walker else 0)
+        row.setdefault("n_image_files", walker.n_images_seen if walker else 0)
         row.setdefault("n_classified", 0)
         row["dicom_mapping_status"] = "not_applicable"
         from .dicom_map import manufacturer_hints

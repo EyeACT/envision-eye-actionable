@@ -386,12 +386,12 @@ class RecordFetcher:
         nested_files: list[tuple[Path, str]] = []
 
         def on_nested(path: Path, display: str) -> int:
-            n0 = len(walker.entries)
+            n0 = walker.n_images_seen
             walker.add_file(path, display)
             walker._drop_if_unused(path)
             if path.exists():
                 nested_files.append((path, display))
-            return len(walker.entries) - n0
+            return walker.n_images_seen - n0
 
         prev = prev or {}
         before = {k: prev.get(k) for k in ("nested_images", "n_nested_fetched", "nested_bytes", "bytes_received",

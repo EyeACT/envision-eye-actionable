@@ -71,6 +71,13 @@ UNRAR = shutil.which("unrar")
 # zipfile can read stored(0), deflate(8), bzip2(12), lzma(14).
 _PY_ZIP_METHODS = {0, 8, 12, 14} | ({9} if _DEFLATE64 else set())
 DICM_MAGIC_OFFSET = 128
+# Names a volume header's data member can end with (constants.volume_companion)
+_COMPANION_SUFFIXES = (".raw", ".zraw", ".img", ".gz")
+# Image entries one record keeps in memory. Past this the walker only counts
+# (n_entries_over_cap): the sample (at most max_images) is drawn from the
+# first MAX_ENTRIES in listing order and the population counts stay exact.
+# 8 million entries (rwave-4096) took several GB of RAM on a 7 GB VM.
+MAX_ENTRIES = 250_000
 
 
 @dataclass(slots=True)
@@ -106,6 +113,8 @@ class RecordWalker:
     disk_floor_bytes: int = 0
     reserved_by_others: object = None      # callable -> bytes other survey processes reserved on this disk
     noext_sniff_limit: int = 2000
+    max_entries: int = MAX_ENTRIES
+    n_entries_over_cap: int = 0            # image entries counted but not kept (max_entries)
     containers: list[Container] = field(default_factory=list)
     entries: list[Entry] = field(default_factory=list)
     kind_counts: Counter = field(default_factory=Counter)
@@ -143,8 +152,16 @@ class RecordWalker:
                 rel = p.relative_to(root).as_posix()
                 self.add_file(p, f"{display_prefix}{rel}", depth)
 
+    @property
+    def n_images_seen(self) -> int:
+        """Image entries listed, the ones over max_entries included."""
+        return len(self.entries) + self.n_entries_over_cap
+
     def _add_entry(self, e: Entry):
-        self.entries.append(e)
+        if len(self.entries) >= self.max_entries:
+            self.n_entries_over_cap += 1
+        else:
+            self.entries.append(e)
         self.image_ext_counts[e.ext] += 1
         if e.container >= 0:
             self.containers[e.container].n_images += 1
@@ -312,11 +329,13 @@ class RecordWalker:
         names: list[str] = []
         n0 = len(self.entries)
         with open_tar_stream(path) as tf:
-            for m in tf:
-                if m.isfile():
-                    names.append(m.name)
+            for m in iter_tar_stream(tf):
                 if not m.isfile():
                     continue
+                # only volume data members can be a header's companion
+                # (volume_companion); keeping every name cost GBs on huge tars
+                if m.name.lower().endswith(_COMPANION_SUFFIXES):
+                    names.append(m.name)
                 kind = file_kind(m.name)
                 if (kind in ("archive", "compressed") and depth < self.max_depth
                         and _nested_worth(m.name, kind)):
@@ -499,7 +518,7 @@ class RecordWalker:
         seen = set()
         try:
             with open_tar_stream(c.path) as tf:
-                for m in tf:
+                for m in iter_tar_stream(tf):
                     if not m.isfile():
                         continue
                     e = wanted.get(m.name)
@@ -679,6 +698,21 @@ def open_zip_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo):
 def _zstd_open(path, mode="rb"):
     import zstandard
     return zstandard.open(path, mode)
+
+
+def iter_tar_stream(tf: tarfile.TarFile) -> Iterator[tarfile.TarInfo]:
+    """Members of a tar opened in streaming (or header walking) mode, with
+    memory that does not grow with the member count. ``for m in tf`` keeps
+    every TarInfo in ``tf.members`` (about 1 KB each), so a tar of millions
+    of small images (rwave-4096: 8 million members) filled the RAM of the
+    process role and got it OOM-killed. The list is emptied after each
+    member; ``tf.extractfile(m)`` works on the current member as before."""
+    while True:
+        m = tf.next()
+        if m is None:
+            return
+        tf.members.clear()
+        yield m
 
 
 def open_tar_stream(path: Path):
