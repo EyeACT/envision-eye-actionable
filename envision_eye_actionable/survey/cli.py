@@ -56,9 +56,9 @@ import os
 import sys
 from pathlib import Path
 
-# The classifier (for example the flagship regnety_004 distilled from
-# synthetic-only training, exported with export-onnx; its .json sidecar holds
-# the checkpoint sha256 and the parity numbers) lives outside the repo.
+# The classifier (for example the v2 flagship regnety004_v2_sup_s3.onnx, whose
+# outputs are read by name; its .json sidecar holds the checkpoint sha256 and
+# the parity numbers) lives outside the repo.
 MODEL_ENV = "ENVISION_SURVEY_MODEL"
 
 

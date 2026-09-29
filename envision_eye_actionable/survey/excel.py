@@ -129,6 +129,8 @@ RECORD_COLUMNS: list[tuple[str, str]] = [
     *[(f"frac_{c}", f"frac {c}") for c in CLASSES + [UNCERTAIN, MASK]],
     *[(f"argmax_frac_{c}", f"argmax frac {c}") for c in CLASSES + [MASK]],
     *[(f"mean_prob_{c}", f"mean p({c})") for c in CLASSES],
+    ("argmax_NEG_by_subtype", "argmax NEG non-mask images by NEG sub-type (models with a sub-type head: "
+                              "other_eye, noneye, eye_nonimage)"),
     ("frac_IR_non_mask", "frac IR of non-mask images"),
     ("argmax_frac_IR_non_mask", "argmax frac IR of non-mask images"),
     ("ir_device_hint", "IR device hint (IR dominant or >= 20% of non-mask images)"),

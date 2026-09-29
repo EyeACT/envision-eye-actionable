@@ -910,10 +910,17 @@ class Survey:
         def flush():
             if not batch:
                 return
-            probs_all = self.clf.predict(np.stack(batch))
+            with_sub = getattr(self.clf, "predict_with_subtype", None)
+            if with_sub is not None:
+                probs_all, sub_all = with_sub(np.stack(batch))
+            else:
+                probs_all, sub_all = self.clf.predict(np.stack(batch)), None
+            sub_labels = list(getattr(self.clf, "neg_subtypes", None) or [])
             k = 0
             for display, facts, n_arr, stratum in batch_meta:
                 pr = probs_all[k:k + n_arr].mean(axis=0)
+                sub = (sub_all[k:k + n_arr].mean(axis=0)
+                       if sub_all is not None and len(sub_labels) == sub_all.shape[1] else None)
                 k += n_arr
                 top = int(pr.argmax())
                 conf = float(pr[top])
@@ -926,14 +933,24 @@ class Survey:
                 veto = flagged and CLASSES[top] == "NEG"
                 mask = flagged and not veto
                 label = MASK if mask else model_label
+                # NEG sub-type (models with a sub-type head): which kind of
+                # negative an argmax-NEG image is (other eye imaging such as
+                # FA/ICGA, not eye, eye-related non-image). Informational only.
+                neg_sub = (sub_labels[int(sub.argmax())]
+                           if sub is not None and CLASSES[top] == "NEG" else None)
                 preds.append({"cls": label, "top": MASK if mask else CLASSES[top], "conf": conf, "probs": pr,
-                              "facts": facts, "path": display, "mask": mask, "stratum": stratum})
+                              "facts": facts, "path": display, "mask": mask, "stratum": stratum,
+                              "neg_subtype": neg_sub})
                 if pred_fp:
                     rec = {"path": display, "label": label, "top": CLASSES[top],
                            "p": round(conf, 4), "probs": [round(float(x), 4) for x in pr],
                            "rows": facts.get("rows"), "cols": facts.get("cols"),
                            "frames": facts.get("frames"), "format": facts.get("source_format"),
                            "conversion": facts.get("conversion")}
+                    if sub is not None:
+                        rec["neg_subtype_probs"] = [round(float(x), 4) for x in sub]
+                    if neg_sub:
+                        rec["neg_subtype"] = neg_sub
                     if n_arr > 1:
                         rec["n_frames_averaged"] = n_arr
                     if mask:
@@ -1087,6 +1104,10 @@ class Survey:
         nm = [p for p in preds if not p["mask"]]
         nm_w = sum(p["w"] for p in nm)
         row["n_classified_non_mask"] = len(nm)
+        # argmax-NEG non-mask images by NEG sub-type (empty for models without
+        # a sub-type head); unweighted image counts.
+        row["argmax_NEG_by_subtype"] = dict(Counter(p["neg_subtype"] for p in nm
+                                                    if p.get("neg_subtype")).most_common())
         # IR share of the non-mask images (the IR trigger in ir_device_fields
         # uses these, so masks cannot dilute a substantial IR share).
         row["frac_IR_non_mask"] = round(wcounts.get("IR", 0) / nm_w, 4) if nm else None

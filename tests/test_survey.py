@@ -3559,3 +3559,97 @@ def test_unsampled_files_follow_a_sample_that_was_all_non_pixel(tmp_path):
     s = _survey(tmp_path / "b", _legacy(rid, files), files, rid, remote_cap=12)
     row = s.process_record({"source_id": rid, "title": "T"})
     assert row["status"] == "images_unreadable" and row["n_pixel_files_unread_by_reason"]["decode_error"] == 1
+
+
+# --------------------------------------------------------- v2 multi-output ONNX
+class _SubtypeClf(_BrightNegDarkOctClf):
+    """As _BrightNegDarkOctClf, with a v2-style NEG sub-type head (bright NEG
+    images are 'other_eye')."""
+
+    neg_subtypes = ["other_eye", "noneye", "eye_nonimage"]
+
+    def predict_with_subtype(self, batch):
+        p = self.predict(batch)
+        sub = np.tile(np.array([[0.1, 0.8, 0.1]]), (len(batch), 1))
+        sub[batch[:, 0].mean(axis=(1, 2)) > 0] = [0.7, 0.2, 0.1]
+        return p, sub
+
+
+def test_neg_subtype_recorded_per_image_and_per_record(tmp_path):
+    pytest.importorskip("jsonschema")
+    rid = "770"
+    bright = _png_bytes(size=(64, 48), color=(220, 220, 220))
+    dark = _png_bytes(size=(64, 48), color=(40, 40, 40))
+    files = {"imgs.zip": _zip_bytes({f"b{i}.png": bright for i in range(3)} | {f"d{i}.png": dark for i in range(4)})}
+    s = _survey(tmp_path, _legacy(rid, files), files, rid, remote_cap=50)
+    s.clf = _SubtypeClf()
+    row = s.process_record({"source_id": rid, "title": "T"})
+    assert row["n_NEG"] == 3 and row["n_OCT"] == 4, row.get("error")
+    assert row["argmax_NEG_by_subtype"] == {"other_eye": 3}
+    import gzip
+    preds = [json.loads(x) for x in gzip.open(s.cfg.out_dir / "predictions" / f"{rid}.jsonl.gz", "rt")]
+    neg = [p for p in preds if p.get("top") == "NEG"]
+    oct_ = [p for p in preds if p.get("top") == "OCT"]
+    assert len(neg) == 3 and all(p["neg_subtype"] == "other_eye" for p in neg)
+    assert all("neg_subtype" not in p and len(p["neg_subtype_probs"]) == 3 for p in oct_)
+
+
+def test_single_output_classifier_has_empty_subtype_counts(tmp_path):
+    pytest.importorskip("jsonschema")
+    rid = "771"
+    files = {"a.png": _png_bytes(size=(64, 48), color=(220, 220, 220))}
+    s = _survey(tmp_path, _legacy(rid, files), files, rid)
+    s.clf = _BrightNegDarkOctClf()
+    row = s.process_record({"source_id": rid, "title": "T"})
+    assert row["n_NEG"] == 1 and row["argmax_NEG_by_subtype"] == {}
+
+
+def test_pick_outputs_reads_named_logits_not_output_order():
+    from envision_eye_actionable.survey.classifier import pick_outputs
+    assert pick_outputs(["logits"], {}) == ("logits", None, [])
+    assert pick_outputs(["output"], {}) == ("output", None, [])          # legacy single output
+    assert pick_outputs(["logits9", "neg_subtype", "logits"], {"neg_subtypes": ["a", "b", "c"]}) == \
+        ("logits", "neg_subtype", ["a", "b", "c"])
+    assert pick_outputs(["logits", "neg_subtype", "logits9"], {})[2] == ["other_eye", "noneye", "eye_nonimage"]
+    with pytest.raises(ValueError):
+        pick_outputs(["out0", "out1"], {})                                # ambiguous multi-output model
+
+
+def test_onnx_classifier_uses_named_logits_output(tmp_path, monkeypatch):
+    import sys
+    import types
+    from envision_eye_actionable.survey import classifier as C
+
+    z7 = np.array([[0.0, 0, 0, 0, 5.0, 0, 0]], np.float32)            # OCT
+    z9 = np.array([[9.0, 0, 0, 0, 0, 0, 0, 0, 0]], np.float32)        # would read as CFP if taken by index
+    sub = np.array([[0.2, 0.5, 0.3]], np.float32)
+
+    class _O:
+        def __init__(self, n):
+            self.name = n
+
+    class _Sess:
+        def __init__(self, *a, **k):
+            pass
+
+        def get_inputs(self):
+            return [_O("input")]
+
+        def get_outputs(self):
+            return [_O("logits9"), _O("logits"), _O("neg_subtype")]
+
+        def run(self, names, feed):
+            got = {"logits9": z9, "logits": z7, "neg_subtype": sub}
+            return [np.repeat(got[n], len(feed["input"]), 0) for n in names]
+
+    fake = types.SimpleNamespace(InferenceSession=_Sess, SessionOptions=lambda: types.SimpleNamespace(),
+                                 GraphOptimizationLevel=types.SimpleNamespace(ORT_ENABLE_ALL=99),
+                                 set_default_logger_severity=lambda *_: None)
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake)
+    m = tmp_path / "m.onnx"
+    m.write_bytes(b"x")
+    clf = C.OnnxClassifier(m)
+    p, s = clf.predict_with_subtype(np.zeros((2, 3, 224, 224), np.float32))
+    assert p.shape == (2, 7) and int(p[0].argmax()) == 4 and abs(float(p[0].sum()) - 1) < 1e-6
+    assert s.shape == (2, 3) and clf.neg_subtypes == ["other_eye", "noneye", "eye_nonimage"]
+    assert np.allclose(clf.predict(np.zeros((1, 3, 224, 224), np.float32)), p[:1])

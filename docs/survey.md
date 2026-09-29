@@ -81,12 +81,41 @@ It warns when the sidecar is missing or has no parity result.
 
 ### Flagship model
 
-The flagship model is `regnety004_synthonly_distill_s2.onnx`: timm
-`regnety_004`, 7 classes (CFP, IR, PSC, FAF, OCT, OCTA, NEG), distilled
-from synthetic-only training (seed 2), same preprocessing as before. Keep
-it outside the repository with its `.json` sidecar next to it, and point
-the CLI at it with `--model` or the `ENVISION_SURVEY_MODEL` environment
-variable (there is no built-in default path). Export checks:
+The flagship model is `regnety004_v2_sup_s3.onnx` (v2, 2026-09-29): timm
+`regnety_004` trained supervised (seed 3) with 9 logits (the 6 eye classes
+plus 3 NEG sub-types: `other_eye`, `noneye`, `eye_nonimage`), same
+preprocessing as before. Its ONNX file has three outputs, read by name:
+
+- `logits` (N, 7): the survey classes (CFP, IR, PSC, FAF, OCT, OCTA, NEG),
+  the NEG logit being the logsumexp of the 3 NEG logits. The survey takes
+  its softmax and plain argmax (with `--threshold`), as before;
+- `neg_subtype` (N, 3): softmax over the 3 NEG logits. The survey records
+  it per image in the predictions file (`neg_subtype_probs`, and
+  `neg_subtype` for argmax-NEG images) and per record as
+  `argmax_NEG_by_subtype` (a Records column). Informational only;
+- `logits9`: the raw training logits (not read).
+
+A model with a single output is read at index 0 as before; a model with
+several outputs and none named `logits` is refused. The sidecar's fitted
+thresholds (`decision_rule`) are not used. Export checks for v2 (export
+script of the retrain): ONNX sha256
+`28181318c3aa774d39facb9c1895f615434bf3c0e769efdec3c5cb79f1aaf1de`,
+checkpoint sha256
+`e9ddebf87013ce9edc438e74318e739e02cf62200d5f35a0abc225c18a60079f`;
+random input 3.7e-6; 27 real validation images through the survey's
+`images.load_frame` + `images.preprocess`: max difference 1.5e-5, argmax
+27 of 27. Re-checked through the survey's own `OnnxClassifier` on the
+survey host against PyTorch outputs for the same 27 images: max
+probability difference 9.0e-7, NEG sub-type difference 3.3e-6, argmax 27
+of 27.
+
+Keep the model outside the repository with its `.json` sidecar next to it,
+and point the CLI at it with `--model` or the `ENVISION_SURVEY_MODEL`
+environment variable (there is no built-in default path).
+
+The previous flagship, `regnety004_synthonly_distill_s2.onnx` (7 classes,
+distilled from synthetic-only FAF training, seed 2, one output), was
+checked as follows:
 - checkpoint sha256 `09c50d57520ac24aab8c3045859e3bdade48388c749081e79b2c2f6484ce6902`,
   ONNX sha256 `2c6e04885c6444e10e66b7dd418c1cedeb1b8eb8cf4c8ef28ae3215aeab20eec`;
 - random input: max logit difference 1.2e-6;
@@ -115,7 +144,7 @@ Defaults follow the envision-discovery layout, so run from its root:
 
 ```bash
 cd /path/to/envision-discovery
-export ENVISION_SURVEY_MODEL=/path/outside/repo/regnety004_synthonly_distill_s2.onnx
+export ENVISION_SURVEY_MODEL=/path/outside/repo/regnety004_v2_sup_s3.onnx
 envision-survey run --scratch-dir /path/to/scratch --limit 3    # smoke test
 envision-survey run --ids 7505822 12775880                     # specific records
 envision-survey excel --out results/survey/zenodo_modality_survey.xlsx
@@ -134,7 +163,7 @@ the shell redirect needs it and put the model on the command line itself:
 ```bash
 cd /path/to/envision-discovery
 mkdir -p results/survey
-nohup envision-survey run --model /path/outside/repo/regnety004_synthonly_distill_s2.onnx \
+nohup envision-survey run --model /path/outside/repo/regnety004_v2_sup_s3.onnx \
     --out-dir results/survey --scratch-dir /path/to/scratch > results/survey/run.log 2>&1 &
 tail -f results/survey/run.log            # a missing model or path shows up here at once
 ```
@@ -563,7 +592,7 @@ From the envision-discovery checkout root, with the 30,501-record scrape
 copied next to the old results (do not overwrite the older scrape):
 
 ```bash
-MODEL=/path/outside/repo/regnety004_synthonly_distill_s2.onnx
+MODEL=/path/outside/repo/regnety004_v2_sup_s3.onnx
 OUT=results/survey_pull; STATE=results/survey_pull_state; SPOOL=/big/disk/survey_spool
 mkdir -p $OUT $STATE
 # optional pass 0: record and DataCite JSON for every record (about 2 requests each,

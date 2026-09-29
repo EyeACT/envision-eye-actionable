@@ -62,6 +62,36 @@ def read_sidecar(model_path: Path) -> dict:
     return meta
 
 
+LOGITS_OUTPUT = "logits"
+NEG_SUBTYPE_OUTPUT = "neg_subtype"
+DEFAULT_NEG_SUBTYPES = ["other_eye", "noneye", "eye_nonimage"]
+
+
+def _softmax(z: np.ndarray) -> np.ndarray:
+    z = z - z.max(axis=1, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(axis=1, keepdims=True)
+
+
+def pick_outputs(names: list[str], meta: dict) -> tuple[str, str | None, list[str]]:
+    """Which ONNX outputs to read: the 7-class logits and, when the model has
+    one, the NEG sub-type head.
+
+    Models with several outputs (v2: ``logits``, ``neg_subtype``, ``logits9``)
+    are read by name, so the survey never depends on output order; a
+    single-output model is read at index 0 as before. Returns
+    (logits name, sub-type name or None, sub-type labels)."""
+    if not names:
+        raise ValueError("ONNX model has no outputs")
+    logits = LOGITS_OUTPUT if LOGITS_OUTPUT in names else names[0]
+    if len(names) > 1 and LOGITS_OUTPUT not in names:
+        raise ValueError(f"ONNX model has outputs {names} but none named {LOGITS_OUTPUT!r}; "
+                         "cannot tell which one holds the 7 survey classes")
+    sub = NEG_SUBTYPE_OUTPUT if NEG_SUBTYPE_OUTPUT in names else None
+    labels = list(meta.get("neg_subtypes") or DEFAULT_NEG_SUBTYPES) if sub else []
+    return logits, sub, labels
+
+
 class OnnxClassifier:
     """Batch inference with softmax output in ``CLASSES`` order."""
 
@@ -80,10 +110,21 @@ class OnnxClassifier:
             str(model_path), sess_options=opts, providers=["CPUExecutionProvider"],
         )
         self.input_name = self.session.get_inputs()[0].name
+        names = [o.name for o in self.session.get_outputs()]
+        self.logits_output, self.subtype_output, self.neg_subtypes = pick_outputs(names, self.meta)
+        self._run_names = [self.logits_output] + ([self.subtype_output] if self.subtype_output else [])
+
+    def predict_with_subtype(self, batch: np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:
+        """(N, 3, 224, 224) float32 -> ((N, 7) softmax probabilities, (N, k)
+        NEG sub-type probabilities or None when the model has no sub-type head)."""
+        outs = self.session.run(self._run_names, {self.input_name: batch.astype(np.float32, copy=False)})
+        logits = np.asarray(outs[0])
+        if logits.ndim != 2 or logits.shape[1] != len(CLASSES):
+            raise ValueError(f"ONNX output {self.logits_output!r} has shape {logits.shape}, "
+                             f"expected (N, {len(CLASSES)})")
+        sub = np.asarray(outs[1], dtype=np.float64) if self.subtype_output else None
+        return _softmax(logits), sub
 
     def predict(self, batch: np.ndarray) -> np.ndarray:
         """(N, 3, 224, 224) float32 -> (N, 7) softmax probabilities."""
-        logits = self.session.run(None, {self.input_name: batch.astype(np.float32, copy=False)})[0]
-        logits = logits - logits.max(axis=1, keepdims=True)
-        e = np.exp(logits)
-        return e / e.sum(axis=1, keepdims=True)
+        return self.predict_with_subtype(batch)[0]
