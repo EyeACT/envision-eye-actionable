@@ -39,6 +39,24 @@ def _png_bytes(size=(300, 200), color=(180, 60, 20), mode="RGB", plain=False) ->
     return buf.getvalue()
 
 
+def _field(shape, seed=0, scale=1.0, dtype=np.float64):
+    """A smooth synthetic image (a few 2D sinusoids, mild noise) of
+    ``shape`` (the last two axes are the image): numeric arrays must look
+    like images, since white noise, tables and signals are rejected
+    (formats.image_like)."""
+    rng = np.random.default_rng(seed)
+    h, w = shape[-2], shape[-1]
+    y, x = np.mgrid[0:h, 0:w].astype(np.float64)
+    img = np.zeros((h, w))
+    for _ in range(4):
+        fy, fx, ph = rng.uniform(0.5, 4) / h, rng.uniform(0.5, 4) / w, rng.uniform(0, 6.3)
+        img += np.sin(2 * np.pi * (fy * y + fx * x) + ph)
+    img = (img - img.min()) / (img.max() - img.min())
+    img = img * 0.98 + rng.random(img.shape) * 0.02
+    out = np.broadcast_to(img, shape) if len(shape) > 2 else img
+    return (np.array(out) * scale).astype(dtype)
+
+
 def _mask_png(size=(64, 48), levels=(0, 255)) -> bytes:
     """A binary (or few-level) label map."""
     w, h = size
@@ -2984,23 +3002,23 @@ def test_arrays_pick_an_image_shaped_dataset(tmp_path):
     np.save(tmp_path / "v.npy", vol)
     ld = load_frame("array", ".npy", None, tmp_path / "v.npy")
     assert ld.image is not None and ld.image.size == (96, 128) and "npy (10, 128, 96)" in ld.facts["conversion"]
-    np.savez(tmp_path / "z.npz", labels=np.arange(50), images=np.random.default_rng(0).random((4, 64, 80)))
+    np.savez(tmp_path / "z.npz", labels=np.arange(50), images=_field((4, 64, 80)))
     ld = load_frame("array", ".npz", None, tmp_path / "z.npz")
     assert ld.image is not None and "npz images" in ld.facts["conversion"]
     # a name hint beats a larger plane: oct/bscan over raw/table
     h5py = pytest.importorskip("h5py")
     with h5py.File(tmp_path / "d.h5", "w") as f:
         f["raw/table"] = np.random.default_rng(1).random((300, 400))
-        f["oct/bscan"] = np.random.default_rng(2).random((5, 128, 100)).astype(np.float32)
+        f["oct/bscan"] = _field((5, 128, 100), seed=2, dtype=np.float32)
     ld = load_frame("array", ".h5", None, tmp_path / "d.h5")
     assert "oct/bscan" in ld.facts["conversion"] and ld.image.size == (100, 128)
     # MAT v7.3 (HDF5 after a 512-byte header) and MAT v5
     with h5py.File(tmp_path / "m73.mat", "w", userblock_size=512) as f:
-        f["img"] = np.random.default_rng(3).random((70, 90))
+        f["img"] = _field((70, 90), seed=3)
     ld = load_frame("array", ".mat", None, tmp_path / "m73.mat")
     assert ld.image is not None and ld.facts["source_format"] == "MAT v7.3 (HDF5)"
     scipy_io = pytest.importorskip("scipy.io")
-    scipy_io.savemat(tmp_path / "m5.mat", {"img": np.random.default_rng(4).integers(0, 255, (100, 80)).astype(np.uint8),
+    scipy_io.savemat(tmp_path / "m5.mat", {"img": _field((100, 80), seed=4, scale=255, dtype=np.uint8),
                                            "vec": np.arange(500)})
     ld = load_frame("array", ".mat", None, tmp_path / "m5.mat")
     assert ld.image is not None and "mat img" in ld.facts["conversion"] and ld.facts["source_format"] == "MAT v5"
@@ -3034,7 +3052,7 @@ def test_network_weights_are_not_images(tmp_path):
     with h5py.File(tmp_path / "mixed.h5", "w") as f:
         f["encoder/conv1/weight"] = rng.random((256, 256)).astype(np.float32)
         f["encoder/bn1/running_mean"] = rng.random((128, 128)).astype(np.float32)
-        f["sample"] = rng.random((70, 90)).astype(np.float32)
+        f["sample"] = _field((70, 90), dtype=np.float32)
     ld = load_frame("array", ".h5", None, tmp_path / "mixed.h5")
     assert ld.image is not None and "hdf5 sample" in ld.facts["conversion"], ld.facts
     with h5py.File(tmp_path / "params.h5", "w") as f:
@@ -3047,13 +3065,13 @@ def test_network_weights_are_not_images(tmp_path):
     assert ld.image is None, ld.facts
     # image names that merely contain a parameter word are still images
     with h5py.File(tmp_path / "imgs.h5", "w") as f:
-        f["weighted_images"] = rng.random((80, 80)).astype(np.float32)
+        f["weighted_images"] = _field((80, 80), dtype=np.float32)
     ld = load_frame("array", ".h5", None, tmp_path / "imgs.h5")
     assert ld.image is not None
 
 
 def test_arrays_over_the_budget_are_strided(tmp_path):
-    arr = np.random.default_rng(0).random((600, 800)).astype(np.float32)
+    arr = _field((600, 800), dtype=np.float32)
     np.save(tmp_path / "big.npy", arr)
     ld = load_frame("array", ".npy", None, tmp_path / "big.npy", max_pixels=100_000)
     assert ld.image is not None and "strided 1/3" in ld.facts["conversion"] and ld.image.size == (267, 200)
@@ -3362,7 +3380,7 @@ def test_records_classify_converted_formats(tmp_path):
     (tmp_path / "v").mkdir()
     hdr, raw = _mhd_pair(tmp_path / "v")
     buf = io.BytesIO()
-    np.save(buf, np.random.default_rng(0).random((3, 90, 70)))
+    np.save(buf, _field((3, 90, 70)))
     files = {"scan.vol": (tmp_path / "scan.vol").read_bytes(), "vol.mhd": hdr.read_bytes(),
              "vol.raw": raw.read_bytes(), "stack.npy": buf.getvalue()}
     (tmp_path / "run").mkdir()

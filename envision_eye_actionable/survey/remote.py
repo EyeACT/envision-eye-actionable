@@ -67,7 +67,7 @@ from urllib.parse import quote
 
 import requests
 
-from .constants import IMAGE_KINDS, detect_ext, file_kind, nested_worth, volume_companion
+from .constants import IMAGE_KINDS, detect_ext, file_kind, is_junk_name, nested_worth, volume_companion
 from .zenodo import API, RemoteError, ZenodoClient
 
 logger = logging.getLogger(__name__)
@@ -98,7 +98,6 @@ CONTAINER_LISTING_CAP = 1000
 # longest single prefetch. Everything longer streams in block-sized reads.
 CACHE_MAX_BYTES = 64 << 20
 PREFETCH_MAX_BYTES = 8 << 20
-_JUNK_PREFIXES = ("__MACOSX/",)
 
 
 def file_url(record_id: str, key: str) -> str:
@@ -111,9 +110,7 @@ def container_url(record_id: str, key: str) -> str:
 
 def is_junk_member(name: str) -> bool:
     """macOS resource forks and metadata (__MACOSX/, ._x.png, .DS_Store)."""
-    base = PurePosixPath(name).name
-    return name.startswith(_JUNK_PREFIXES) or "/__MACOSX/" in name or base.startswith("._") \
-        or base == ".DS_Store"
+    return is_junk_name(name)
 
 
 @dataclass

@@ -1283,7 +1283,7 @@ def plan_files(files: list[dict], local_dir: Path, remote_zip: bool = True, offl
         elif remote_zip and not offline and remote_zip_candidate(f["key"], keys):
             remote_zips.append(f)
         elif (download_all or wanted_for_download(f["key"])
-              or (file_kind(f["key"]) == "volume_data" and volume_header_of(f["key"], all_keys))):
+              or (file_kind(f["key"]) in ("volume_data", "other", "noext") and volume_header_of(f["key"], all_keys))):
             # a volume data file (x.raw, x.img) only next to its header
             to_fetch.append(f)
         else:
@@ -1437,11 +1437,13 @@ def _colocate_split_sets(available: list[tuple[Path, str]], dl_dir: Path) -> lis
 
 
 UNREAD_REASONS = (
+    # wrong_format first: its message quotes the decoder error it replaces
+    ("wrong_format", "wrong_format"), ("blank: no finite", "blank"),
     ("too_large", "too_large"), ("companion", "companion_missing"), ("volume data", "companion_missing"),
     ("image-shaped", "not_image_shaped"), ("image shaped", "not_image_shaped"),
     ("not an hdf5", "not_image_shaped"), ("proprietary", "no_reader"), ("no reader", "no_reader"),
     ("no pixel data", "no_pixel_data"), ("pixel decode", "codec"), ("memoryerror", "memory"),
-    ("disk floor", "disk_floor"), ("wrong_format", "wrong_format"),
+    ("disk floor", "disk_floor"),
 )
 # Reasons that show a file was not pixel-bearing after all (an HDF5 of model
 # weights, a Fire Dynamics Simulator .fds): they do not make a record

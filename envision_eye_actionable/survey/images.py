@@ -33,11 +33,19 @@ Which frame is classified:
     DICOM multi-frame:       middle frame
     NIfTI / NRRD / MHA /
     MHD / Analyze pairs:     middle slice along the shortest spatial axis
-    numeric arrays:          image-shaped dataset (see _choose_dataset), middle
-                             slice, strided when large
+    ENVI / BART .hdr pairs:  ENVI default bands as RGB or the middle band;
+                             BART magnitude of the first two dimensions
+    numeric arrays:          first image-like dataset (see _rank_candidates
+                             and formats.image_like), middle slice of a stack,
+                             strided when large; OCT-like volumes also give an
+                             en-face view
     microscopy:              middle Z plane, first channel, time 0
     vendor OCT:              middle B-scan, plus the fundus / SLO image as a view
-    video:                   frames at 25, 50 and 75% of the duration
+    video:                   frames at 25, 50 and 75% of the duration (ffmpeg,
+                             else PyAV, raw H.264 for recordings without index)
+    anything that fails:     its true content (formats.sniff_content): another
+                             codec through imagecodecs, or wrong_format for a
+                             placeholder (XML error page, git-lfs pointer, ...)
 
 Pixel conversion: 8-bit data is kept as is; deeper integers and floats are
 windowed between robust percentiles (0.5 and 99.5, on a subsample) unless
@@ -66,6 +74,9 @@ import numpy as np
 from PIL import Image, ImageFile
 
 from .constants import IMG_SIZE, MEAN, STD, TIFF_EXTS, TRAIN_STORED_SIZE
+from .formats import (NON_IMAGE_CONTENT, bytes_head, image_like, jpeg_frame_info, mat5_variables, octave_array,
+                      octave_text_variables, octave_variables, read_bart, read_envi, safe_unpickle, sniff_content,
+                      walk_arrays)
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +95,7 @@ STRIDED_TARGET_PIXELS = 16_000_000      # pixels of a reduced (strided) decode
 DECODE_MAX_BYTES = 1 << 30              # bytes one plane may take when decoded whole
 PYRAMID_TARGET = 1024                   # a pyramid level whose long side is at least this
 SVG_RENDER_PX = 512                     # SVG render width
+SVG_DPI = 96.0                          # resolution of physical units (pt, mm, in) in SVG sizes
 SVG_MAX_BYTES = 64 << 20
 VENDOR_MAX_BYTES = 3 << 29              # vendor OCT readers load the whole file (1.5 GiB; 7 GB VM)
 ARRAY_MIN_SIDE = 64                     # an image-shaped array plane has both sides at least this
@@ -142,7 +154,27 @@ class Loaded:
 def load_frame(kind: str, ext: str, data: bytes | None, path: Path | None,
                max_pixels: int = 80_000_000, companion: Path | None = None) -> Loaded:
     """Decode one representative frame of an image file (see module doc).
-    ``companion``: the data file of a volume header pair (x.raw of x.mhd)."""
+    ``companion``: the data file of a volume header pair (x.raw of x.mhd).
+
+    A file that gives no image is checked for what it really holds: a text
+    placeholder (git-lfs pointer, git-annex link, XML error page, HTML), a
+    PDF or an empty file under an image name is reported as
+    ``wrong_format`` (not pixel-bearing) rather than a decode error."""
+    out = _load_frame(kind, ext, data, path, max_pixels, companion)
+    if out.image is None and kind in _BINARY_KINDS and not (out.error or "").startswith(("wrong_format", "too_large")):
+        what = sniff_content(bytes_head(data, path))
+        if what in NON_IMAGE_CONTENT:
+            out.facts["content"] = what
+            out.error = f"wrong_format: {what} saved as {ext or 'a file without extension'} ({out.error})"[:200]
+    return out
+
+
+# Kinds whose files are binary: text content in one is a placeholder.
+_BINARY_KINDS = {"raster", "dicom", "volume", "vendor_oct", "video", "array", "microscopy"}
+
+
+def _load_frame(kind: str, ext: str, data: bytes | None, path: Path | None,
+                max_pixels: int = 80_000_000, companion: Path | None = None) -> Loaded:
     tmp = None
     try:
         if data is not None and path is None and kind in ("volume", "volume_pair", "vendor_oct", "video",
@@ -197,6 +229,13 @@ def _finish_image(img: Image.Image, facts: dict, conversion: str, native: np.nda
 def _from_array(arr: np.ndarray, facts: dict, conversion: str) -> Loaded:
     img = array_to_rgb8(arr)
     if img is None:
+        a = np.asarray(arr)
+        if a.size and np.issubdtype(a.dtype, np.floating):
+            with np.errstate(invalid="ignore"):
+                valid = np.isfinite(a) & (np.abs(a) < 1e30)    # GDAL nodata is -3.4e38
+            if not valid.any():
+                return Loaded(None, facts, f"blank: no finite pixel value (all NaN or nodata) in "
+                                           f"{tuple(a.shape)} ({conversion})"[:200])
         return Loaded(None, facts, f"unsupported array shape {tuple(np.shape(arr))} ({conversion})"[:200])
     return _finish_image(img, facts, conversion, native=arr)
 
@@ -217,6 +256,21 @@ def _is_tiff_bytes(data, path) -> bool:
 
 
 def _load_raster(data, path, ext, max_pixels) -> Loaded:
+    """TIFF through tifffile, the rest through Pillow; a file neither can
+    open goes to _raster_fallback (true type by content, imagecodecs)."""
+    try:
+        return _load_raster_pil(data, path, ext, max_pixels)
+    except MemoryError:
+        raise
+    except Exception as e:  # noqa: BLE001 - UnidentifiedImageError, broken streams, odd variants
+        first = f"{type(e).__name__}: {e}"
+    out = _raster_fallback(data, path, ext, max_pixels)
+    if out.image is None and out.error and not out.error.startswith(("wrong_format", "too_large")):
+        out.error = f"{first[:120]}; {out.error}"[:200]
+    return out
+
+
+def _load_raster_pil(data, path, ext, max_pixels) -> Loaded:
     if ext in TIFF_EXTS or _is_tiff_bytes(data, path):
         try:
             return _load_tiff(data, path, ext, max_pixels)
@@ -254,7 +308,8 @@ def _load_raster(data, path, ext, max_pixels) -> Loaded:
             bpp = max(1, (_MODE_BITS.get(im.mode, 8) + 7) // 8)
             if w * h * bands * bpp > DECODE_MAX_BYTES * 2:
                 return Loaded(None, facts, f"too_large ({w}x{h} {im.format}: no reduced decode for this format)")
-        im.seek(0)
+        if getattr(im, "_min_frame", 0) == 0 and im.tell() != 0:
+            im.seek(0)      # Photoshop numbers its layers from 1: the composite is already loaded
         im.load()
         if im.size[0] * im.size[1] > max_pixels:
             factor = math.ceil(math.sqrt(im.size[0] * im.size[1] / STRIDED_TARGET_PIXELS))
@@ -265,6 +320,106 @@ def _load_raster(data, path, ext, max_pixels) -> Loaded:
             native = np.asarray(im)
         rgb = to_rgb8(im)
     return _finish_image(rgb, facts, conversion, native=native)
+
+
+FALLBACK_MAX_BYTES = 256 << 20          # file bytes the imagecodecs fallback reads into memory
+
+# imagecodecs decoders per content kind, tried in order (lossless JPEG,
+# 12-bit JPEG, arithmetic-coded JPEG and CMYK / YCCK through libjpeg-turbo 3
+# (jpeg8) or the lossless-only decoders; JPEG XL, JPEG 2000, JPEG XR).
+_FALLBACK_CODECS = {
+    "jpeg": ("jpeg8", "ljpeg", "jpegsof3"),
+    "jpegxl": ("jpegxl",),
+    "jpeg2000": ("jpeg2k",),
+    "jpegxr": ("jpegxr",),
+    "bmp": ("bmp",),
+    "png": ("png", "apng"),
+    "gif": ("gif",),
+    "webp": ("webp",),
+    "tiff": ("tiff",),
+}
+
+
+def _raster_fallback(data, path, ext, max_pixels) -> Loaded:
+    """A raster Pillow and tifffile could not open: its true type by content
+    (formats.sniff_content), then the matching imagecodecs decoder.
+
+    * text or PDF under an image name (an XML error page saved as .jpeg, a
+      git-lfs pointer, a git-annex link): ``wrong_format``, not pixel-bearing;
+    * an SVG or DICOM under another name: that loader;
+    * lossless (SOF3), 12-bit, arithmetic-coded JPEG: libjpeg-turbo through
+      imagecodecs (jpeg8), else the lossless-only decoders;
+    * JPEG XL, JPEG 2000, JPEG XR, odd BMP / PNG / GIF / WebP variants:
+      imagecodecs.
+
+    The size is checked from the header where it is known (JPEG SOF) before
+    decoding; a file over FALLBACK_MAX_BYTES is not read into memory."""
+    fmt = ext.lstrip(".").upper() or "?"
+    facts: dict = {"format": fmt, "source_format": fmt}
+    head = bytes_head(data, path, 1 << 16)
+    what = sniff_content(head)
+    facts["content"] = what or "unknown"
+    if what in NON_IMAGE_CONTENT:
+        return Loaded(None, facts, f"wrong_format: {what} saved as {ext or 'a file without extension'}")
+    if what == "svg":
+        return _load_svg(data, path, ext, max_pixels)
+    if what == "dicom":
+        return _load_dicom(data, path, max_pixels)
+    size = len(data) if data is not None else Path(path).stat().st_size
+    if size > FALLBACK_MAX_BYTES:
+        return Loaded(None, facts, f"too_large: {size >> 20} MB {what or 'unknown'} file that only the "
+                                   f"whole-file fallback decoder could read")
+    conv = "imagecodecs"
+    if what == "jpeg":
+        info = jpeg_frame_info(head)
+        if info:
+            facts.update({"rows": info["rows"], "cols": info["cols"], "bits": info["precision"],
+                          "samples": info["components"], "jpeg_process": info["process"]})
+            facts["source_format"] = f"JPEG ({info['process']}, {info['precision']}-bit)"
+            if "lossless" in info["process"]:
+                facts["lossy"] = "00"
+            else:
+                facts.update({"lossy": "01", "lossy_method": "ISO_10918_1"})
+            nbytes = info["rows"] * info["cols"] * max(1, info["components"]) * (2 if info["precision"] > 8 else 1)
+            if nbytes > DECODE_MAX_BYTES:
+                return Loaded(None, facts, f"too_large: {info['cols']}x{info['rows']} {info['process']} JPEG "
+                                           f"over {DECODE_MAX_BYTES >> 20} MB decoded (no reduced decode)")
+    elif what:
+        facts["source_format"] = {"jpegxl": "JPEG XL", "jpeg2000": "JPEG 2000", "jpegxr": "JPEG XR"}.get(
+            what, what.upper())
+    import imagecodecs
+    raw = bytes(data) if data is not None else Path(path).read_bytes()
+    arr, errs = None, []
+    for codec in _FALLBACK_CODECS.get(what or "", ()):
+        dec = getattr(imagecodecs, f"{codec}_decode", None)
+        if dec is None:
+            continue
+        try:
+            arr = dec(raw)
+            conv = f"imagecodecs {codec}"
+            break
+        except Exception as e:  # noqa: BLE001
+            errs.append(f"{codec}: {type(e).__name__}: {e}"[:80])
+    if arr is None:
+        try:
+            arr, codec = imagecodecs.imread(raw, return_codec=True)
+            conv = f"imagecodecs imread ({getattr(codec, '__name__', codec)})"
+        except Exception as e:  # noqa: BLE001
+            errs.append(f"imread: {type(e).__name__}: {e}"[:80])
+    del raw
+    if arr is None:
+        return Loaded(None, facts, f"no decoder for this {what or 'unknown'} content ({'; '.join(errs)[:150]})")
+    arr = np.asarray(arr)
+    while arr.ndim > 3 or (arr.ndim == 3 and arr.shape[-1] not in (1, 3, 4) and arr.shape[0] < arr.shape[-1]):
+        arr = arr[0]                                  # first frame of an animation or a multi-page file
+    facts.setdefault("rows", int(arr.shape[0]))
+    facts.setdefault("cols", int(arr.shape[1]))
+    facts.setdefault("bits", int(arr.dtype.itemsize * 8))
+    if arr.shape[0] * arr.shape[1] > max_pixels:
+        step = math.ceil(math.sqrt(arr.shape[0] * arr.shape[1] / STRIDED_TARGET_PIXELS))
+        arr = arr[::step, ::step]
+        conv += f" strided 1/{step}"
+    return _from_array(arr, facts, conv)
 
 
 def _pick_level(series):
@@ -611,8 +766,10 @@ def _exif_dt(s: str) -> str:
 # ---------------------------------------------------------------------------
 # SVG
 # ---------------------------------------------------------------------------
-_DATA_IMG = re.compile(rb"""(?:xlink:)?href\s*=\s*["']data:image/(png|jpe?g|gif|bmp|webp|tiff?);base64,([^"']+)["']""",
-                       re.I)
+# data URIs of any image subtype, with optional parameters before ;base64
+# (image/png;charset=utf-8;base64, image/x-png;base64, image/jpg;base64)
+_DATA_IMG = re.compile(rb"""(?:xlink:)?href\s*=\s*["']\s*data:image/([\w.+-]+)(?:;[\w.+-]+=[^;,"']*)*;base64,"""
+                       rb"""([^"']+)["']""", re.I)
 _HREF = re.compile(rb"""((?:xlink:)?href)\s*=\s*(["'])(.*?)\2""", re.I | re.S)
 
 
@@ -671,8 +828,12 @@ def _load_svg(data, path, ext, max_pixels: int = 80_000_000) -> Loaded:
     clean = _HREF.sub(keep_local, raw)
     clean = re.sub(rb"@import[^;]*;", b"", clean)
     with tempfile.TemporaryDirectory() as empty:
+        # dpi: resvg-py defaults to 0, which turns every physical unit
+        # (width="504pt", "210mm", "5in": what matplotlib, R and Inkscape
+        # write) into a zero size ("SVG has an invalid size"). 96 is the
+        # CSS reference resolution.
         png = resvg_py.svg_to_bytes(svg_string=clean.decode("utf-8", "replace"), width=SVG_RENDER_PX,
-                                    background="#ffffff", resources_dir=empty)
+                                    background="#ffffff", resources_dir=empty, dpi=SVG_DPI)
     im = Image.open(io.BytesIO(bytes(png)))
     im.load()
     facts.update({"rows": im.height, "cols": im.width})
@@ -737,6 +898,12 @@ def _load_dicom(data, path, max_pixels) -> Loaded:
     try:
         from pydicom.pixels import pixel_array as _pixel_array  # pydicom >= 3
         src2 = io.BytesIO(data) if data is not None else str(path)
+        if _add_transfer_syntax(ds):
+            # A file without file meta (no preamble, written by some
+            # planning and dose systems): decode from the dataset, whose
+            # encoding pydicom detected, with the matching transfer syntax.
+            src2 = ds
+            facts["source_format"] = f"DICOM (no file meta, {ds.file_meta.TransferSyntaxUID.name})"
         arr = _pixel_array(src2, index=mid)
     except ImportError:
         pass
@@ -760,6 +927,25 @@ def _load_dicom(data, path, max_pixels) -> Loaded:
         arr = arr[::step, ::step]
         conv += f" strided 1/{step}"
     return _from_array(arr, facts, conv)
+
+
+def _add_transfer_syntax(ds) -> bool:
+    """Give a dataset read without file meta the transfer syntax of its
+    detected encoding (implicit or explicit VR, little or big endian).
+    True when it had none; False when it had one already."""
+    fm = getattr(ds, "file_meta", None)
+    if fm is not None and str(getattr(fm, "TransferSyntaxUID", "") or ""):
+        return False
+    from pydicom.dataset import FileMetaDataset
+    from pydicom.uid import ExplicitVRBigEndian, ExplicitVRLittleEndian, ImplicitVRLittleEndian
+    implicit, little = getattr(ds, "original_encoding", (None, None))
+    if implicit is None:
+        implicit, little = True, True
+    if fm is None:
+        ds.file_meta = fm = FileMetaDataset()
+    fm.TransferSyntaxUID = (ImplicitVRLittleEndian if implicit else
+                            ExplicitVRLittleEndian if little in (True, None) else ExplicitVRBigEndian)
+    return True
 
 
 def dicom_header(ds) -> dict:
@@ -817,6 +1003,17 @@ def _load_volume(path: Path, ext: str, max_pixels: int, max_bytes: int = 2 << 30
         sib = volume_companion(path.name, [p.name for p in path.parent.iterdir()])
         if sib is None:
             return Loaded(None, facts, "volume data file (companion of the header) not available")
+        companion = path.parent / sib
+    if ext == ".hdr":
+        with open(path, "rb") as fp:
+            head = fp.read(64)
+        if head.startswith(b"ENVI"):
+            return _load_envi(path, companion, facts, max_pixels)
+        if head.lstrip().lower().startswith(b"# dimensions"):
+            return _load_bart(path, companion, facts, max_pixels)
+        if head.startswith((b"#?RADIANCE", b"#?RGBE")):
+            facts["source_format"] = "Radiance HDR"
+            return Loaded(None, facts, "no reader for Radiance RGBE .hdr images")
     if ext in (".nii", ".nii.gz", ".hdr"):
         arr = _nifti_slice(path, facts, max_pixels, max_bytes)
         reader = "nibabel"
@@ -848,6 +1045,59 @@ def _load_volume(path: Path, ext: str, max_pixels: int, max_bytes: int = 2 << 30
     return _from_array(arr, facts, conv)
 
 
+def _load_envi(header: Path, data: Path, facts: dict, max_pixels: int) -> Loaded:
+    """ENVI cube (hyperspectral, SAR, remote sensing): the three bands its
+    header names as ``default bands`` as an RGB composite, else the middle
+    band; memory-mapped, strided when over the pixel budget."""
+    cube, h = read_envi(header, data)                 # (lines, samples, bands) view
+    lines, samples, bands = (int(x) for x in cube.shape)
+    facts.update({"format": "ENVI", "source_format": f"ENVI ({h.get('interleave', 'bsq').lower()})",
+                  "frames": bands, "shape": [lines, samples, bands]})
+    if plane_plan((lines, samples)) is None:
+        # a push-broom line (1 x samples x bands) or a strip: spectra, not an image
+        return Loaded(None, facts, f"not image shaped: ENVI {lines} lines x {samples} samples x {bands} bands")
+    step = 1
+    if lines * samples > max_pixels:
+        step = math.ceil(math.sqrt(lines * samples / STRIDED_TARGET_PIXELS))
+    default = [int(x) - 1 for x in re.findall(r"\d+", h.get("default bands", ""))]
+    if len(default) == 3 and all(0 <= b < bands for b in default):
+        arr = np.stack([np.asarray(cube[::step, ::step, b]) for b in default], axis=-1)
+        conv = f"ENVI default bands {[b + 1 for b in default]} as RGB"
+    else:
+        arr = np.asarray(cube[::step, ::step, bands // 2])
+        conv = f"ENVI band {bands // 2 + 1}/{bands}"
+    if np.iscomplexobj(arr):
+        arr = np.abs(arr)
+        conv += " magnitude"
+    if step > 1:
+        conv += f" strided 1/{step}"
+    facts.update({"rows": int(arr.shape[0]), "cols": int(arr.shape[1]), "bits": int(arr.dtype.itemsize * 8)})
+    return _from_array(arr, facts, conv)
+
+
+def _load_bart(header: Path, data: Path, facts: dict, max_pixels: int) -> Loaded:
+    """BART .hdr + .cfl (complex64, column-major; MRI k-space or images):
+    the magnitude of the plane of the first two non-singleton dimensions,
+    index 0 of every other dimension (coil, echo, ...)."""
+    arr = read_bart(header, data)
+    dims = [int(d) for d in arr.shape]
+    live = [i for i, n in enumerate(dims) if n > 1]
+    facts.update({"format": "BART", "source_format": "BART cfl (complex)", "shape": dims})
+    if len(live) < 2:
+        return Loaded(None, facts, f"not image shaped: BART dims {dims}")
+    idx = tuple(slice(None) if i in live[:2] else 0 for i in range(len(dims)))
+    r, c = dims[live[0]], dims[live[1]]
+    if plane_plan((r, c)) is None:
+        return Loaded(None, facts, f"not image shaped: BART plane {r} x {c} (dims {dims})")
+    step = math.ceil(math.sqrt(r * c / STRIDED_TARGET_PIXELS)) if r * c > max_pixels else 1
+    if step > 1:
+        idx = tuple(slice(None, None, step) if isinstance(s, slice) else s for s in idx)
+    plane = np.abs(np.asarray(arr[idx]))
+    facts.update({"rows": int(plane.shape[0]), "cols": int(plane.shape[1]), "bits": 32, "float": True})
+    conv = f"BART dims {live[0]},{live[1]} magnitude" + (f" strided 1/{step}" if step > 1 else "")
+    return _from_array(plane, facts, conv)
+
+
 def _refuse(facts: dict, msg: str) -> None:
     facts["_error"] = msg
     return None
@@ -866,6 +1116,12 @@ def _nifti_slice(path: Path, facts: dict, max_pixels: int, max_bytes: int):
     img = nib.load(str(path))
     shape = tuple(int(s) for s in img.shape)
     facts["shape"] = list(shape)
+    if not hasattr(img.header, "get_zooms"):
+        # CIFTI-2 (.dlabel / .dtseries / .dscalar .nii): values per surface
+        # vertex or parcel, no voxel grid to slice
+        facts["source_format"] = f"CIFTI-2 ({type(img).__name__})"
+        return _refuse(facts, "not image shaped: CIFTI-2 grayordinate data (surface vertices and parcels, "
+                              "no voxel grid)")
     zooms = [float(z) for z in img.header.get_zooms()[:3]]
     axis, idx = _pick_slice(shape)
     if axis is None:
@@ -995,19 +1251,31 @@ def _pick_slice(shape: tuple[int, ...]) -> tuple[int | None, int]:
 
 
 # ---------------------------------------------------------------------------
-# numeric arrays (NumPy, HDF5 / MAT v7.3 / Imaris, MAT v5)
+# numeric arrays (NumPy, HDF5 / MAT v7.3 / Imaris, MAT v5, Octave)
 # ---------------------------------------------------------------------------
-def plane_plan(shape: tuple[int, ...]) -> tuple[tuple, tuple[int, int]] | None:
-    """Index to take one 2D image (with channels when the last axis has 3 or
-    4) out of an array of ``shape``, and that image's (rows, cols); None when
-    the array is not image shaped.
+STACK_MAX_ASPECT = 4                    # the two image axes of a stack are at most this elongated
+ARRAY_MAX_TRIES = 6                     # image-shaped candidates tried before giving up on a file
+PICKLE_MAX_BYTES = 256 << 20            # a pickled object array is read whole: only up to this size
+MAT_STRUCT_MAX_BYTES = 256 << 20        # MAT v5 structs and cells are loaded whole: files up to this size
+ENFACE_MAX_BYTES = 256 << 20            # an OCT-like volume is projected en face when it is at most this big
+OCT_NAME_HINT = re.compile(r"(^|[^a-z])(oct|bscan|b_scan|bscans|cube|volume|vol)($|[^a-z])", re.I)
 
-    Size-1 axes are dropped (index 0). With channels last (3 or 4) the rest
-    must be 2D, or 3D (middle slice along its shortest axis). Otherwise the
-    last three axes hold the image: the middle slice along the shortest of
-    them; extra leading axes take index 0. The image must have both sides of
-    at least ARRAY_MIN_SIDE and an aspect ratio of at most ARRAY_MAX_ASPECT
-    (signals, tables and feature matrices are not images)."""
+
+def _plane_axes(shape: tuple[int, ...]):
+    """(index, (rows, cols), stack axis or None, row axis, col axis) of the
+    2D image taken out of an array of ``shape``, or None when it is not
+    image shaped.
+
+    Size-1 axes take index 0. A last axis of 3 or 4 is the channel axis
+    (kept whole), and so is a first axis of 3 or 4 in front of two image
+    axes (channels first). Of more than three remaining axes the leading
+    ones take index 0. Of three, the stack axis is the first when the last
+    two look like an image (both at least ARRAY_MIN_SIDE, at most
+    STACK_MAX_ASPECT elongated: NumPy and HDF5 stacks, OCT volumes of
+    B-scans), else the last when the first two do (MATLAB H x W x N), else
+    the shortest; the stack gives its middle slice. The image must have both
+    sides of at least ARRAY_MIN_SIDE and an aspect ratio of at most
+    ARRAY_MAX_ASPECT (signals and tables are not images)."""
     if len(shape) < 2:
         return None
     idx: list = [slice(None)] * len(shape)
@@ -1017,19 +1285,41 @@ def plane_plan(shape: tuple[int, ...]) -> tuple[tuple, tuple[int, int]] | None:
             idx[i] = 0
     if len(live) < 2:
         return None
+
+    def squareish(a: int, b: int) -> bool:
+        return min(a, b) >= ARRAY_MIN_SIDE and max(a, b) <= STACK_MAX_ASPECT * min(a, b)
+
     if len(live) >= 3 and shape[live[-1]] in (3, 4):
         live = live[:-1]                  # channels last: kept whole
+    elif len(live) == 3 and shape[live[0]] in (3, 4) and squareish(shape[live[1]], shape[live[2]]):
+        live = live[1:]                   # channels first: kept whole
     while len(live) > 3:
         idx[live[0]] = 0
         live = live[1:]
+    stack = None
     if len(live) == 3:
-        ax = min(live, key=lambda i: (shape[i], i))
-        idx[ax] = shape[ax] // 2
-        live = [i for i in live if i != ax]
+        a, b, c = (shape[i] for i in live)
+        if squareish(b, c):
+            stack = live[0]
+        elif squareish(a, b):
+            stack = live[2]
+        else:
+            stack = min(live, key=lambda i: (shape[i], i))
+        idx[stack] = shape[stack] // 2
+        live = [i for i in live if i != stack]
     r, c = shape[live[0]], shape[live[1]]
     if min(r, c) < ARRAY_MIN_SIDE or max(r, c) > ARRAY_MAX_ASPECT * min(r, c):
         return None
-    return tuple(idx), (int(r), int(c))
+    return tuple(idx), (int(r), int(c)), stack, live[0], live[1]
+
+
+def plane_plan(shape: tuple[int, ...]) -> tuple[tuple, tuple[int, int]] | None:
+    """Index to take one 2D image (with channels when the last axis, or the
+    first of three, has 3 or 4) out of an array of ``shape``, and that
+    image's (rows, cols); None when the array is not image shaped (see
+    _plane_axes)."""
+    got = _plane_axes(tuple(int(s) for s in shape))
+    return None if got is None else (got[0], got[1])
 
 
 def _strided(idx: tuple, plane: tuple[int, int], max_pixels: int) -> tuple[tuple, int]:
@@ -1049,51 +1339,145 @@ def _strided(idx: tuple, plane: tuple[int, int], max_pixels: int) -> tuple[tuple
     return tuple(out), step
 
 
-def _choose_dataset(cands: list[tuple[str, tuple, np.dtype]]):
-    """Best image-shaped candidate: name hint (img, image, oct, bscan, vol,
-    fundus, slo, frame) first, then the largest plane. Returns
-    (name, index, plane) or None."""
-    best = None
+def _rank_candidates(cands: list[tuple[str, tuple, object]]) -> list[tuple]:
+    """Image-shaped candidates, best first: (name, index, plane, shape,
+    stack axis, row axis). A name hint (img, image, oct, bscan, vol, fundus,
+    slo, frame) ranks first, then a dataset outside MATLAB's ``#refs#``
+    store, then the largest plane. Network parameters (kernel, bias,
+    weight, running_mean, ...) and non-numeric data (strings, references,
+    records) are never candidates; complex data is (its magnitude)."""
+    ranked = []
     for name, shape, dtype in cands:
         try:
             dt = np.dtype(dtype)
         except TypeError:
             continue
-        if not (np.issubdtype(dt, np.number) or dt == np.bool_) or np.issubdtype(dt, np.complexfloating):
+        if not (np.issubdtype(dt, np.number) or dt == np.bool_):
             continue
         if ARRAY_PARAM_NAME.search(name):
             continue                      # a network layer's parameters
-        plan = plane_plan(tuple(int(s) for s in shape))
-        if plan is None:
+        shape = tuple(int(s) for s in shape)
+        got = _plane_axes(shape)
+        if got is None:
             continue
-        idx, plane = plan
+        idx, plane, stack, row_ax, _col_ax = got
         base = name.rsplit("/", 1)[-1]
-        score = (bool(ARRAY_NAME_HINT.search(base)), plane[0] * plane[1])
-        if best is None or score > best[0]:
-            best = (score, name, idx, plane)
-    return None if best is None else best[1:]
+        score = (bool(ARRAY_NAME_HINT.search(base)), not name.startswith("#refs#"), plane[0] * plane[1])
+        ranked.append((score, name, idx, plane, shape, stack, row_ax))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return [r[1:] for r in ranked]
+
+
+def _choose_dataset(cands: list[tuple[str, tuple, np.dtype]]):
+    """Best image-shaped candidate (see _rank_candidates): (name, index,
+    plane) or None."""
+    ranked = _rank_candidates(cands)
+    return None if not ranked else ranked[0][:3]
+
+
+def _pick_array_image(ranked: list[tuple], fetch, facts: dict, what: str, max_pixels: int,
+                      n_cands: int) -> Loaded:
+    """The first of the ranked candidates (at most ARRAY_MAX_TRIES) whose
+    plane is image like (formats.image_like: not a table, a stack of
+    signals or noise) and converts to an image. ``fetch(name, index)``
+    returns the indexed data. The variable used goes to
+    ``facts['array_variable']``; an OCT-like volume (name hint) also gives
+    an en-face projection as the view ``enface``."""
+    tried = []
+    for name, idx, plane, shape, stack, row_ax in ranked[:ARRAY_MAX_TRIES]:
+        sidx, step = _strided(idx, plane, max_pixels)
+        try:
+            arr = np.asarray(fetch(name, sidx))
+        except MemoryError:
+            raise
+        except Exception as e:  # noqa: BLE001 - one unreadable dataset never hides the next
+            tried.append(f"{name}: {type(e).__name__}")
+            continue
+        conv = f"{what} {name} {shape}" if name != "array" else f"{what} {shape}"
+        if np.iscomplexobj(arr):
+            arr = np.abs(arr)
+            conv += " magnitude"
+        ok, ratio = image_like(np.squeeze(arr))
+        if not ok:
+            tried.append(f"{name} ratio {ratio:.2f}")
+            continue
+        f = dict(facts)
+        f["array_variable"] = name
+        f["array_shape"] = list(shape)
+        if ratio is not None:
+            f["neighbour_ratio"] = round(ratio, 3)
+        if stack is not None:
+            f["frames"] = int(shape[stack])
+            conv += f" slice {shape[stack] // 2}/{shape[stack]} of axis {stack}"
+        out = _array_result(arr, f, conv, step)
+        if out.image is None:
+            tried.append(f"{name}: {out.error}"[:60])
+            continue
+        if stack is not None and OCT_NAME_HINT.search(name.rsplit("/", 1)[-1]):
+            _add_enface(out, fetch, name, idx, shape, stack, row_ax, max_pixels)
+        return out
+    detail = f" ({'; '.join(tried)})" if tried else ""
+    return Loaded(None, facts, f"not image shaped: no image-like array among {n_cands}{detail}"[:200])
+
+
+def _add_enface(out: Loaded, fetch, name: str, idx: tuple, shape: tuple, stack: int, row_ax: int,
+                max_pixels: int):
+    """En-face projection of an OCT-like volume (mean along the depth axis,
+    the rows of its B-scans) as the view ``enface``. Only for volumes up to
+    ENFACE_MAX_BYTES (as float32), read in chunks of B-scans."""
+    n = int(shape[stack])
+    plane_ax = [i for i, s in enumerate(idx) if isinstance(s, slice) and i != stack]
+    if n < 16 or len(plane_ax) != 2:
+        return
+    col_ax = plane_ax[0] if plane_ax[1] == row_ax else plane_ax[1]
+    total = n * int(shape[row_ax]) * int(shape[col_ax]) * 4
+    if total > ENFACE_MAX_BYTES:
+        return
+    rows = []
+    chunk = max(1, (32 << 20) // max(1, int(shape[row_ax]) * int(shape[col_ax]) * 4))
+    for k0 in range(0, n, chunk):
+        sl = list(idx)
+        sl[stack] = slice(k0, min(n, k0 + chunk))
+        block = np.asarray(fetch(name, tuple(sl)))
+        if np.iscomplexobj(block):
+            block = np.abs(block)
+        # axes left in the block keep their order: map stack and row axes
+        left = [i for i, s in enumerate(sl) if isinstance(s, slice)]
+        b_stack, b_row = left.index(stack), left.index(row_ax)
+        proj = np.nanmean(block.astype(np.float32), axis=b_row)
+        b_stack_after = b_stack if b_stack < b_row else b_stack - 1
+        rows.append(np.moveaxis(proj, b_stack_after, 0))
+    enface = np.concatenate(rows, axis=0)
+    img = array_to_rgb8(enface)
+    if img is None:
+        return
+    ff: dict = {"conversion": f"{out.facts.get('conversion', '').split(' slice')[0]} en-face mean along axis {row_ax}",
+                "rows": img.height, "cols": img.width, "array_variable": name}
+    _pixel_flags(img, ff)
+    out.views.append(("enface", img, ff))
 
 
 def _load_array(path: Path, ext: str, max_pixels: int) -> Loaded:
     facts: dict = {"format": ext.lstrip(".").upper(), "source_format": ext.lstrip(".").upper()}
     with open(path, "rb") as fp:
-        head = fp.read(520)
-    is_h5 = head[:8] == b"\x89HDF\r\n\x1a\n" or head[512:520] == b"\x89HDF\r\n\x1a\n"
-    if ext == ".npy":
-        arr = np.load(path, mmap_mode="r", allow_pickle=False)
-        got = _choose_dataset([("array", arr.shape, arr.dtype)])
-        if got is None:
-            return Loaded(None, facts, f"not image shaped: {tuple(arr.shape)} {arr.dtype}")
-        name, idx, plane = got
-        idx, step = _strided(idx, plane, max_pixels)
-        return _array_result(np.asarray(arr[idx]), facts, f"npy {tuple(arr.shape)}", step)
-    if ext == ".npz":
-        return _load_npz(path, facts, max_pixels)
-    if is_h5:
+        head = fp.read(4096)
+    what = sniff_content(head)
+    if what == "octave":
+        facts["source_format"] = f"Octave binary ({ext})"
+        return _load_octave(path, facts, max_pixels)
+    if what == "octave text":
+        facts["source_format"] = f"Octave text ({ext})"
+        pairs = octave_text_variables(path)
+        return _arrays_in_memory(pairs, facts, "octave text", max_pixels)
+    if what == "hdf5":
         facts["source_format"] = "MAT v7.3 (HDF5)" if ext == ".mat" else f"HDF5 ({ext})"
         return _load_h5(path, facts, max_pixels)
+    if ext == ".npy" or what == "npy":
+        return _load_npy(path, facts, max_pixels)
+    if ext == ".npz":
+        return _load_npz(path, facts, max_pixels)
     if ext == ".mat":
-        facts["source_format"] = "MAT v5"
+        facts["source_format"] = "MAT v5" if what == "mat5" else "MAT (v4 or unknown)"
         return _load_mat5(path, facts, max_pixels)
     return Loaded(None, facts, "not an HDF5 or NumPy file")
 
@@ -1104,6 +1488,10 @@ def _array_result(arr: np.ndarray, facts: dict, what: str, step: int) -> Loaded:
         arr = np.moveaxis(arr, 0, -1)
     if arr.dtype == np.bool_:
         arr = arr.astype(np.uint8)
+    if np.iscomplexobj(arr):
+        arr = np.abs(arr)
+    if arr.ndim < 2:
+        return Loaded(None, facts, f"not image shaped: {arr.shape} ({what})"[:200])
     facts["rows"], facts["cols"] = int(arr.shape[0]), int(arr.shape[1])
     facts["bits"] = int(arr.dtype.itemsize * 8)
     if np.issubdtype(arr.dtype, np.floating):
@@ -1112,19 +1500,51 @@ def _array_result(arr: np.ndarray, facts: dict, what: str, step: int) -> Loaded:
     return _from_array(arr, facts, conv)
 
 
+def _arrays_in_memory(pairs: list[tuple[str, np.ndarray]], facts: dict, what: str, max_pixels: int) -> Loaded:
+    """Pick and convert from (name, ndarray) pairs already in memory."""
+    lookup = {n: a for n, a in pairs}
+    ranked = _rank_candidates([(n, a.shape, a.dtype) for n, a in pairs])
+    return _pick_array_image(ranked, lambda n, i: lookup[n][i], facts, what, max_pixels, len(pairs))
+
+
 def _npy_header(fp):
     """(shape, fortran_order, dtype) of a .npy stream, positioned at its data."""
     fmt = np.lib.format
     version = fmt.read_magic(fp)
     if version == (1, 0):
         return fmt.read_array_header_1_0(fp)
-    if version == (2, 0):
-        return fmt.read_array_header_2_0(fp)
-    return fmt._read_array_header(fp, version)
+    # version 3 differs from 2 only in the header text encoding (utf-8)
+    return fmt.read_array_header_2_0(fp)
+
+
+def _load_npy(path: Path, facts: dict, max_pixels: int) -> Loaded:
+    with open(path, "rb") as fp:
+        shape, _fortran, dtype = _npy_header(fp)
+        if dtype.hasobject:
+            # np.save of a dict, a list or ragged arrays: a pickle. Read with
+            # the NumPy-only allow-list (formats.safe_unpickle), never with
+            # allow_pickle=True.
+            facts["source_format"] = "NPY (pickled object array)"
+            size = path.stat().st_size
+            if size > PICKLE_MAX_BYTES:
+                return Loaded(None, facts, f"too_large: pickled object array of {size >> 20} MB over "
+                                           f"{PICKLE_MAX_BYTES >> 20} MB")
+            try:
+                obj = safe_unpickle(fp)
+            except Exception as e:  # noqa: BLE001 - UnpicklingError on a refused global
+                return Loaded(None, facts, f"not image shaped: pickled object array not read "
+                                           f"({type(e).__name__}: {e})"[:200])
+            pairs = walk_arrays(obj, "array")
+            return _arrays_in_memory(pairs, facts, "npy object", max_pixels)
+    arr = np.load(path, mmap_mode="r", allow_pickle=False)
+    ranked = _rank_candidates([("array", arr.shape, arr.dtype)])
+    if not ranked:
+        return Loaded(None, facts, f"not image shaped: {tuple(arr.shape)} {arr.dtype}")
+    return _pick_array_image(ranked, lambda n, i: arr[i], facts, "npy", max_pixels, 1)
 
 
 def _load_npz(path: Path, facts: dict, max_pixels: int) -> Loaded:
-    cands = []
+    cands, objects, too_big = [], [], []
     with zipfile.ZipFile(path) as zf:
         for info in zf.infolist():
             if not info.filename.endswith(".npy"):
@@ -1134,33 +1554,48 @@ def _load_npz(path: Path, facts: dict, max_pixels: int) -> Loaded:
                     shape, fortran, dtype = _npy_header(fp)
                 except Exception:  # noqa: BLE001
                     continue
+                if dtype.hasobject:
+                    if info.file_size <= PICKLE_MAX_BYTES and len(objects) < 16:
+                        try:
+                            objects += walk_arrays(safe_unpickle(fp), info.filename[:-4])
+                        except Exception:  # noqa: BLE001 - refused global: not read
+                            pass
+                    continue
+            if (int(np.prod(shape, dtype=np.int64)) * dtype.itemsize > DECODE_MAX_BYTES
+                    and info.compress_type != zipfile.ZIP_STORED):
+                too_big.append(info.filename[:-4])     # compressed: no partial read
+                continue
             cands.append((info.filename[:-4], shape, dtype))
-        got = _choose_dataset(cands)
-        if got is None:
-            return Loaded(None, facts, f"no image-shaped array among {len(cands)}")
-        name, idx, plane = got
-        info = zf.getinfo(name + ".npy")
-        dtype = np.dtype(next(d for n, s, d in cands if n == name))
-        shape = next(s for n, s, d in cands if n == name)
-        if int(np.prod(shape, dtype=np.int64)) * dtype.itemsize > DECODE_MAX_BYTES:
-            if info.compress_type == zipfile.ZIP_STORED:
+        meta = {n: (s, d) for n, s, d in cands}
+        loaded: dict = {n: a for n, a in objects}
+
+        def fetch(name, idx):
+            if name in loaded:
+                return loaded[name][idx]
+            shape, dtype = meta[name]
+            info = zf.getinfo(name + ".npy")
+            if int(np.prod(shape, dtype=np.int64)) * np.dtype(dtype).itemsize > DECODE_MAX_BYTES:
                 # np.savez stores members uncompressed: map the member in place.
                 with open(path, "rb") as fp:
                     fp.seek(info.header_offset)
                     lh = fp.read(30)
                     n_len, x_len = struct.unpack("<HH", lh[26:30])
-                    start = info.header_offset + 30 + n_len + x_len
-                    fp.seek(start)
+                    fp.seek(info.header_offset + 30 + n_len + x_len)
                     _npy_header(fp)
                     data_off = fp.tell()
-                arr = np.memmap(path, dtype=dtype, mode="r", offset=data_off, shape=tuple(shape))
+                arr = np.memmap(path, dtype=np.dtype(dtype), mode="r", offset=data_off, shape=tuple(shape))
             else:
-                return Loaded(None, facts, f"too_large: compressed npz member {name} over {DECODE_MAX_BYTES >> 20} MB")
-        else:
-            with zf.open(info) as fp:
-                arr = np.lib.format.read_array(fp, allow_pickle=False)
-    idx, step = _strided(idx, plane, max_pixels)
-    return _array_result(np.asarray(arr[idx]), facts, f"npz {name} {tuple(shape)}", step)
+                with zf.open(info) as fp:
+                    arr = np.lib.format.read_array(fp, allow_pickle=False)
+            return arr[idx]
+
+        ranked = _rank_candidates(cands + [(n, a.shape, a.dtype) for n, a in objects])
+        if not ranked:
+            if too_big:
+                return Loaded(None, facts, f"too_large: compressed npz member {too_big[0]} over "
+                                           f"{DECODE_MAX_BYTES >> 20} MB")
+            return Loaded(None, facts, f"not image shaped: no image-shaped array among {len(cands) + len(objects)}")
+        return _pick_array_image(ranked, fetch, facts, "npz", max_pixels, len(cands) + len(objects))
 
 
 def _load_h5(path: Path, facts: dict, max_pixels: int) -> Loaded:
@@ -1172,38 +1607,100 @@ def _load_h5(path: Path, facts: dict, max_pixels: int) -> Loaded:
 
         def visit(name, obj):
             if isinstance(obj, h5py.Dataset) and len(cands) < 5000:
+                try:
+                    mclass = obj.attrs.get("MATLAB_class")
+                except Exception:  # noqa: BLE001
+                    mclass = None
+                if isinstance(mclass, bytes):
+                    mclass = mclass.decode("latin1")
+                if mclass == "char":
+                    return                  # a MATLAB string stored as uint16 codes
                 cands.append((name, obj.shape, obj.dtype))
         f.visititems(visit)
-        got = _choose_dataset(cands)
-        if got is None:
+        ranked = _rank_candidates(cands)
+        if not ranked:
             return Loaded(None, facts, f"no image-shaped dataset among {len(cands)}")
-        name, idx, plane = got
-        ds = f[name]
-        idx, step = _strided(idx, plane, max_pixels)
-        arr = ds[idx]
-        shape = tuple(ds.shape)
-    # MATLAB v7.3 stores arrays transposed (column-major): the image is the
-    # transpose, which only matters for orientation, not for the class.
-    return _array_result(arr, facts, f"hdf5 {name} {shape}", step)
+        # MATLAB v7.3 stores arrays transposed (column-major): the image is
+        # the transpose, which only matters for orientation, not the class.
+        return _pick_array_image(ranked, lambda n, i: f[n][i], facts, "hdf5", max_pixels, len(cands))
+
+
+_MAT_TYPES = {"double": "f8", "single": "f4", "int8": "i1", "uint8": "u1", "int16": "i2", "uint16": "u2",
+              "int32": "i4", "uint32": "u4", "int64": "i8", "uint64": "u8", "logical": "u1"}
 
 
 def _load_mat5(path: Path, facts: dict, max_pixels: int) -> Loaded:
+    """MAT v5 (and v4): variable headers through scipy's whosmat, or the
+    survey's own header reader when whosmat fails (a MATLAB object in the
+    file); numeric variables are loaded one at a time (variable_names),
+    structs and cells of files up to MAT_STRUCT_MAX_BYTES are loaded and
+    searched for numeric arrays when no numeric variable is image like."""
     import scipy.io
-    _MAT_TYPES = {"double": "f8", "single": "f4", "int8": "i1", "uint8": "u1", "int16": "i2", "uint16": "u2",
-                  "int32": "i4", "uint32": "u4", "int64": "i8", "uint64": "u8", "logical": "u1"}
-    info = scipy.io.whosmat(str(path))
-    cands = [(n, s, _MAT_TYPES[c]) for n, s, c in info if c in _MAT_TYPES]
-    got = _choose_dataset(cands)
-    if got is None:
-        return Loaded(None, facts, f"no image-shaped variable among {len(info)}")
-    name, idx, plane = got
-    shape, code = next((s, c) for n, s, c in cands if n == name)
-    if int(np.prod(shape, dtype=np.int64)) * np.dtype(code).itemsize > DECODE_MAX_BYTES:
-        return Loaded(None, facts, f"too_large: MAT v5 variable {name} {tuple(shape)} over {DECODE_MAX_BYTES >> 20} MB "
+    try:
+        info = [(n, tuple(s), c, False) for n, s, c in scipy.io.whosmat(str(path))]
+        lister = "whosmat"
+    except Exception as e:  # noqa: BLE001 - "'NoneType' object is not iterable" on MATLAB objects
+        if facts.get("source_format") != "MAT v5":
+            raise
+        info = mat5_variables(path)
+        lister = "header reader"
+        facts["mat_lister"] = f"own header reader (whosmat: {type(e).__name__})"
+    cands, too_big = [], []
+    for n, s, c, cplx in info:
+        if c not in _MAT_TYPES:
+            continue
+        code = ("c16" if c == "double" else "c8") if cplx else _MAT_TYPES[c]
+        if int(np.prod(s, dtype=np.int64)) * np.dtype(code).itemsize > DECODE_MAX_BYTES:
+            too_big.append(n)
+            continue
+        cands.append((n, s, code))
+    cache: dict = {}
+
+    def fetch(name, idx):
+        if name not in cache:
+            cache.clear()
+            cache[name] = scipy.io.loadmat(str(path), variable_names=[name])[name]
+        return np.asarray(cache[name])[idx]
+
+    ranked = _rank_candidates(cands)
+    out = None
+    if ranked:
+        out = _pick_array_image(ranked, fetch, facts, "mat", max_pixels, len(info))
+        if out.image is not None:
+            return out
+    cache.clear()
+    containers = [n for n, s, c, _ in info if c in ("struct", "cell")]
+    if containers and path.stat().st_size <= MAT_STRUCT_MAX_BYTES:
+        pairs: list = []
+        for n in containers[:8]:
+            try:
+                d = scipy.io.loadmat(str(path), variable_names=[n], simplify_cells=True)
+            except Exception:  # noqa: BLE001 - one unreadable struct never hides the next
+                continue
+            walk_arrays(d.get(n), n, out=pairs)
+        if pairs:
+            got = _arrays_in_memory(pairs, facts, f"mat struct/cell ({lister})", max_pixels)
+            if got.image is not None or out is None:
+                return got
+    if out is not None:
+        return out
+    if too_big:
+        return Loaded(None, facts, f"too_large: MAT v5 variable {too_big[0]} over {DECODE_MAX_BYTES >> 20} MB "
                                    "(MAT v5 has no partial read)")
-    arr = scipy.io.loadmat(str(path), variable_names=[name])[name]
-    idx, step = _strided(idx, plane, max_pixels)
-    return _array_result(np.asarray(arr)[idx], facts, f"mat {name} {tuple(shape)}", step)
+    return Loaded(None, facts, f"no image-shaped variable among {len(info)}")
+
+
+def _load_octave(path: Path, facts: dict, max_pixels: int) -> Loaded:
+    """GNU Octave binary save file: numeric matrices memory-mapped
+    (formats.octave_variables)."""
+    vars_ = octave_variables(path)
+    by_name = {v[0]: v for v in vars_}
+    cands = [(v[0], v[1], np.dtype("c16") if v[4] else v[2]) for v in vars_]
+    ranked = _rank_candidates(cands)
+    if not ranked:
+        return Loaded(None, facts, f"no image-shaped variable among {len(vars_)}")
+    return _pick_array_image(ranked, lambda n, i: octave_array(path, by_name[n])[i], facts, "octave",
+                             max_pixels, len(vars_))
 
 
 # ---------------------------------------------------------------------------
@@ -1212,20 +1709,90 @@ def _load_mat5(path: Path, facts: dict, max_pixels: int) -> Loaded:
 def _load_microscopy(path: Path, ext: str, max_pixels: int) -> Loaded:
     facts: dict = {"format": ext.lstrip(".").upper(), "source_format": ext.lstrip(".").upper()}
     if ext == ".czi":
-        from pylibCZIrw import czi as pyczi
-        with pyczi.open_czi(str(path)) as doc:
-            box = doc.total_bounding_box
-            rect = doc.total_bounding_rectangle
-            plane = {a: (lo + (hi - lo) // 2 if a == "Z" else lo) for a, (lo, hi) in box.items()
-                     if a in ("Z", "C", "T")}
-            w, h = int(rect.w), int(rect.h)
-            zoom = min(1.0, math.sqrt(min(max_pixels, STRIDED_TARGET_PIXELS) / max(1, w * h)))
-            arr = doc.read(plane=plane, zoom=zoom)
-        facts.update({"full_rows": h, "full_cols": w})
-        arr = np.asarray(arr)
-        if arr.ndim == 3 and arr.shape[-1] == 3:
-            arr = arr[..., ::-1]                      # BGR -> RGB
-        return _array_result(arr, facts, f"pylibCZIrw plane {plane} zoom {zoom:.3g}", 1)
+        first_out = None
+        try:
+            first_out = _load_czi_libczi(path, dict(facts), max_pixels)
+            if first_out.image is not None:
+                return first_out
+            first = first_out.error or "no image"
+        except MemoryError:
+            raise
+        except Exception as e:  # noqa: BLE001 - pixel types and scan modes pylibCZIrw rejects
+            first = f"{type(e).__name__}: {e}"
+        try:
+            out = _load_czi_czifile(path, dict(facts), max_pixels)
+            if out.image is not None or first_out is None:
+                return out
+            return first_out
+        except MemoryError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            return first_out or Loaded(None, facts, f"pylibCZIrw: {first[:80]}; czifile: {type(e).__name__}: "
+                                                    f"{e}"[:200])
+    return _load_microscopy_other(path, ext, facts, max_pixels)
+
+
+CZI_PLANE_MAX_BYTES = 1 << 30              # decoded bytes of the one plane the czifile fallback composes
+
+
+def _load_czi_czifile(path: Path, facts: dict, max_pixels: int) -> Loaded:
+    """CZI through czifile (pixel types such as Bgra32 and line scans that
+    pylibCZIrw rejects): first scene, the pyramid level whose long side is
+    at least PYRAMID_TARGET, middle Z plane, first channel and time point.
+    A line scan (no Y axis) keeps Z, else T, as its rows (an XZ or XT
+    image)."""
+    import czifile
+    with czifile.CziFile(str(path)) as cz:
+        sc = cz.scenes[0]
+        levels = list(getattr(sc, "levels", None) or [sc])
+        lv = levels[0]
+        for cand in levels:
+            sz = dict(zip(cand.dims, cand.shape))
+            if max(sz.get("Y", 0), sz.get("X", 0)) >= PYRAMID_TARGET:
+                lv = cand
+        dims, shape, start = list(lv.dims), list(lv.shape), list(lv.start)
+        rows_dim = "Y" if "Y" in dims else next((d for d in ("Z", "T") if d in dims), None)
+        sel = {}
+        for i, d in enumerate(dims):
+            if d in ("X", "S") or d == rows_dim:
+                continue
+            sel[d] = int(start[i]) + (int(shape[i]) // 2 if d == "Z" else 0)
+        sub = lv(**sel) if sel else lv
+        if int(sub.nbytes) > CZI_PLANE_MAX_BYTES:
+            return Loaded(None, facts, f"too_large: CZI plane of {int(sub.nbytes) >> 20} MB over "
+                                       f"{CZI_PLANE_MAX_BYTES >> 20} MB")
+        arr = np.asarray(sub.asarray())
+        pixeltype = int(getattr(sub, "pixeltype", 0) or 0)
+    facts.update({"source_format": "CZI", "czi_dims": "".join(dims)})
+    if arr.ndim == 3 and arr.shape[-1] in (3, 4):
+        arr = arr[..., [2, 1, 0]]                      # Bgr24 / Bgra32 / Bgr48 -> RGB, alpha dropped
+    step = 1
+    if arr.ndim >= 2 and arr.shape[0] * arr.shape[1] > max_pixels:
+        step = math.ceil(math.sqrt(arr.shape[0] * arr.shape[1] / STRIDED_TARGET_PIXELS))
+        arr = arr[::step, ::step]
+    return _array_result(arr, facts, f"czifile {''.join(dims)} plane {sel} pixel type {pixeltype}", step)
+
+
+def _load_czi_libczi(path: Path, facts: dict, max_pixels: int) -> Loaded:
+    """CZI through pylibCZIrw: the middle Z plane, first channel and time
+    point, composed over all tiles at a zoom within the pixel budget."""
+    from pylibCZIrw import czi as pyczi
+    with pyczi.open_czi(str(path)) as doc:
+        box = doc.total_bounding_box
+        rect = doc.total_bounding_rectangle
+        plane = {a: (lo + (hi - lo) // 2 if a == "Z" else lo) for a, (lo, hi) in box.items()
+                 if a in ("Z", "C", "T")}
+        w, h = int(rect.w), int(rect.h)
+        zoom = min(1.0, math.sqrt(min(max_pixels, STRIDED_TARGET_PIXELS) / max(1, w * h)))
+        arr = doc.read(plane=plane, zoom=zoom)
+    facts.update({"full_rows": h, "full_cols": w})
+    arr = np.asarray(arr)
+    if arr.ndim == 3 and arr.shape[-1] == 3:
+        arr = arr[..., ::-1]                      # BGR -> RGB
+    return _array_result(arr, facts, f"pylibCZIrw plane {plane} zoom {zoom:.3g}", 1)
+
+
+def _load_microscopy_other(path: Path, ext: str, facts: dict, max_pixels: int) -> Loaded:
     if ext == ".lif":
         from readlif.reader import LifFile
         img = LifFile(str(path)).get_image(0)
@@ -1290,9 +1857,22 @@ def _load_vendor(path: Path, ext: str, max_pixels: int) -> Loaded:
     if size > VENDOR_MAX_BYTES:
         return Loaded(None, facts, f"too_large: vendor file over {VENDOR_MAX_BYTES / 2**30:g} GiB (the readers load it whole)")
     with open(path, "rb") as fp:
-        head = fp.read(16)
+        head = fp.read(1024)
     bscan = fundus = None
     conv = ""
+    if not head.startswith(b"HSF-OCT") and not (ext == ".oct" and head[:2] == b"PK"):
+        # The extension is shared with other formats: .vol is also a
+        # cryo-EM / tomography volume (MRC), .oct a GNU Octave save file.
+        what = sniff_content(head)
+        if what == "mrc":
+            out = _load_microscopy(path, ".mrc", max_pixels)
+            out.facts["source_format"] = f"MRC volume ({ext})"
+            return out
+        if what in ("octave", "octave text", "hdf5", "npy", "mat5"):
+            return _load_array(path, ".mat" if what == "mat5" else ext, max_pixels)
+        if ext == ".vol":
+            return Loaded(None, facts, "no reader for a .vol without the Heidelberg HSF-OCT signature "
+                                       f"({what or 'unknown content'})")
     if ext == ".vol" or head.startswith(b"HSF-OCT"):
         bscan, fundus, n = _read_heidelberg_vol(path)
         facts.update({"source_format": "Heidelberg VOL", "make": "Heidelberg Engineering", "frames": n})
@@ -1480,7 +2060,89 @@ VIDEO_POSITIONS = (0.5, 0.25, 0.75)      # first is the main image
 
 def _load_video(path: Path, ext: str) -> Loaded:
     """Frames at 25, 50 and 75% of the duration (bundled ffmpeg through
-    imageio-ffmpeg); the runner averages their class probabilities."""
+    imageio-ffmpeg); the runner averages their class probabilities. When
+    the ffmpeg binary cannot read the file (it fails on some containers
+    whose index is missing or at the end), PyAV (libav in-process, which
+    can scan the stream instead) is tried."""
+    try:
+        out = _load_video_ffmpeg(path, ext)
+        if out.image is not None:
+            return out
+        first = out.error or "no frame decoded"
+    except Exception as e:  # noqa: BLE001 - ffmpeg stderr is long: keep its first line
+        first = f"{type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}"
+    try:
+        return _load_video_av(path, ext)
+    except ImportError:
+        raise RuntimeError(f"ffmpeg: {first}"[:200]) from None
+    except Exception as e:  # noqa: BLE001
+        facts = {"format": ext.lstrip(".").upper(), "source_format": f"video {ext.lstrip('.').upper()}"}
+        return Loaded(None, facts, f"ffmpeg: {first[:80]}; PyAV: {type(e).__name__}: {e}"[:200])
+
+
+VIDEO_SCAN_FRAMES = 600     # frames PyAV decodes from the start when it cannot seek
+
+
+def _load_video_av(path: Path, ext: str) -> Loaded:
+    """Frames at 25, 50 and 75% of the duration through PyAV (seek by
+    time), or, without a duration or seek, frames spread over the first
+    VIDEO_SCAN_FRAMES decoded ones."""
+    import av
+    facts: dict = {"format": ext.lstrip(".").upper(), "source_format": f"video {ext.lstrip('.').upper()}"}
+    frames: list = []
+    with open(path, "rb") as fp:
+        head = fp.read(256)
+    m = head.find(b"mdat")
+    # A recording that stopped before its index (moov) was written: the
+    # container cannot be opened, but an mdat holding an Annex-B H.264
+    # stream (start code 00 00 00 01) decodes as raw H.264.
+    raw_h264 = m >= 4 and head[m + 4:m + 8] == b"\x00\x00\x00\x01"
+    try:
+        c = av.open(str(path))
+    except Exception:  # noqa: BLE001 - av.error.InvalidDataError
+        if not raw_h264:
+            raise
+        c = av.open(str(path), format="h264")
+        facts["source_format"] = f"video {ext.lstrip('.').upper()} without index (raw H.264 stream)"
+    with c:
+        s = c.streams.video[0]
+        duration = float(c.duration / 1e6) if c.duration else (
+            float(s.duration * s.time_base) if s.duration and s.time_base else 0.0)
+        facts.update({"rows": int(s.height or 0), "cols": int(s.width or 0), "duration_s": round(duration, 2),
+                      "codec": str(s.codec_context.name or "")[:40]})
+        if duration > 0:
+            for pos in VIDEO_POSITIONS:
+                try:
+                    c.seek(int(duration * pos * 1e6), any_frame=False)     # microseconds (AV_TIME_BASE)
+                    fr = next(c.decode(s), None)
+                except Exception:  # noqa: BLE001 - unseekable stream: scan below
+                    fr = None
+                if fr is not None:
+                    frames.append(fr.to_image().convert("RGB"))
+        if not frames:
+            if duration > 0:
+                try:
+                    c.seek(0)
+                except Exception:  # noqa: BLE001
+                    pass
+            picked = []                       # every 100th frame: at most 6
+            for k, fr in enumerate(c.decode(s)):
+                if k >= VIDEO_SCAN_FRAMES:
+                    break
+                if k % 100 == 0:
+                    picked.append(fr.to_image().convert("RGB"))
+            if picked:
+                mid = len(picked) // 2
+                frames = [picked[mid]] + [f for i, f in enumerate(picked) if i != mid][:2]
+    if not frames:
+        return Loaded(None, facts, "no frame decoded (PyAV)")
+    facts["frames_classified"] = len(frames)
+    out = _finish_image(frames[0], facts, f"PyAV frames ({len(frames)})")
+    out.frames = frames[1:]
+    return out
+
+
+def _load_video_ffmpeg(path: Path, ext: str) -> Loaded:
     import imageio_ffmpeg
     facts: dict = {"format": ext.lstrip(".").upper(), "source_format": f"video {ext.lstrip('.').upper()}"}
     gen = imageio_ffmpeg.read_frames(str(path))
@@ -1545,7 +2207,14 @@ def array_to_rgb8(arr: np.ndarray) -> Image.Image | None:
     # the shortest axis.
     while arr.ndim > 3 or (arr.ndim == 3 and arr.shape[-1] not in (1, 3, 4)):
         axis = int(np.argmin(arr.shape))
-        arr = np.take(arr, 0, axis=axis)
+        k = 0
+        if np.issubdtype(arr.dtype, np.floating):
+            # first band holding a finite value (a NaN-filled first band of
+            # a remote-sensing stack would make the whole file blank)
+            with np.errstate(invalid="ignore"):
+                k = next((i for i in range(min(arr.shape[axis], 32))
+                          if (np.abs(np.take(arr, i, axis=axis)) < 1e30).any()), 0)
+        arr = np.take(arr, k, axis=axis)
     if arr.ndim == 3 and arr.shape[-1] == 1:
         arr = arr[..., 0]
     alpha = None

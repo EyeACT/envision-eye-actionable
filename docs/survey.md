@@ -949,9 +949,27 @@ accept):
      4571628 are read, where the old run refused them (`too_large`).
    - JPEG is decoded at a reduced DCT scale when large, JPEG 2000 at a
      reduced resolution level; PNG, BMP, GIF, WebP, PSD (the composite),
-     HEIC and AVIF (`pillow-heif`) go through Pillow.
-   - SVG: the largest embedded raster image (a figure wrapping a photo),
-     else the drawing rendered 512 px wide on white with `resvg`. Every
+     HEIC and AVIF (`pillow-heif`) go through Pillow. A raster Pillow and
+     tifffile cannot open is identified by its content
+     (`formats.sniff_content`): lossless (SOF3), 12-bit and
+     arithmetic-coded JPEG are decoded through `imagecodecs` (libjpeg-turbo
+     3, else the lossless-only decoders; the size is read from the frame
+     header first), as are JPEG XL, JPEG 2000, JPEG XR and odd BMP / PNG /
+     GIF / WebP variants (`imagecodecs.imread` as the last resort). An SVG
+     or DICOM under an image name goes to its own loader.
+   - Placeholders under image names (an S3 `AccessDenied` XML page saved
+     as `thumb0.jpeg`, a git-lfs pointer, a git-annex link committed as
+     text, a PDF, an HTML page, an empty file) are `wrong_format` with the
+     content kind in `facts["content"]`: not pixel-bearing, so they never
+     make a record `images_unreadable`. The check runs on every binary
+     kind (raster, DICOM, volume, vendor OCT, video, array, microscopy)
+     after its loader failed.
+   - SVG: the largest embedded raster image (a figure wrapping a photo;
+     data URIs of any image subtype, with parameters such as
+     `;charset=utf-8` before `;base64`), else the drawing rendered 512 px
+     wide on white with `resvg` at 96 dpi (resvg-py defaults to 0 dpi,
+     which made every size in pt, mm or in, as matplotlib and R write it,
+     an invalid zero size). Every
      reference that is not an in-document fragment or an embedded data URI
      is removed first and resources resolve in an empty directory, so
      rendering reads nothing outside the file and fetches nothing. Memory
@@ -961,23 +979,62 @@ accept):
      is then `too_large` unless a smaller embedded image can be used).
    - DICOM: the middle frame of a multi-frame file, with the compressed
      transfer syntaxes common in ophthalmology decoded (JPEG lossless,
-     JPEG-LS and JPEG 2000 through `pylibjpeg`, RLE natively).
+     JPEG-LS and JPEG 2000 through `pylibjpeg`, RLE natively). A file
+     without file meta (no preamble; RT dose grids) gets the transfer
+     syntax of its detected encoding before decoding. An extensionless file
+     counts as preamble-less DICOM only when its first two data elements
+     parse (group 0002 or 0008, ascending tags, a known VR or a short
+     implicit length): one plausible element also matched SQLite pages.
    - NIfTI, NRRD, MHA and header + data pairs (MHD + RAW through
      SimpleITK, Analyze HDR + IMG through nibabel, detached NRRD): the
-     middle slice along the shortest axis. The uncompressed voxel size is
+     middle slice along the shortest axis. A `.hdr` is told apart by
+     content: an ENVI header (data in x.img, x.dat, x.raw, x.bsq / .bil /
+     .bip or x without an extension; the cube is memory-mapped in any
+     interleave and gives its `default bands` as RGB, else its middle band;
+     a push-broom line of 1 x N samples is `not_image_shaped`), a BART
+     header (`# Dimensions`, complex64 data in x.cfl: the magnitude of the
+     plane of the first two non-singleton dimensions), or Analyze. The data
+     file of each is fetched next to its header (top-level files, zip and
+     tar members). CIFTI-2 (`.dlabel.nii`, `.dtseries.nii`) holds values per
+     surface vertex or parcel, no voxel grid: `not_image_shaped`. The uncompressed voxel size is
      computed from the header first, and volumes over 2 GiB uncompressed
      are not loaded (a small gzip NRRD can expand to many GB). NIfTI is
      sliced through the nibabel proxy and MHA/NRRD through a SimpleITK
      extract region, so only the slice is materialised.
    - Numeric arrays (`.npy`, `.npz`, HDF5 incl. Imaris `.ims`, MAT v7.3
-     through h5py, MAT v5 through scipy): among the numeric datasets, the
-     image-shaped ones (after dropping size-1 axes and a last axis of 3 or
-     4 channels, a 2D plane, or the middle slice of the shortest of the
-     last three axes, with both sides at least 64 px and an aspect ratio of
-     at most 32, so signals and tables are not images); a name such as
-     image, oct, bscan, vol, fundus or frame wins over a larger plane. Only
-     the chosen slice is read (h5py and memory-mapped NumPy slice lazily,
-     strided when large). Network parameters are never candidates: a
+     through h5py, MAT v5 through scipy, GNU Octave binary and text save
+     files): among the numeric datasets (complex ones by their magnitude),
+     the image-shaped ones: after dropping size-1 axes and a channel axis
+     of 3 or 4 (last, or first in front of two image axes), a 2D plane or
+     the middle slice of a stack, with both sides at least 64 px and an
+     aspect ratio of at most 32. Of three axes the stack is the first when
+     the last two look like an image (both at least 64 px, at most 4 times
+     elongated: NumPy and HDF5 stacks, OCT volumes of B-scans), else the
+     last when the first two do (MATLAB H x W x N), else the shortest. A
+     name such as image, oct, bscan, vol, fundus or frame wins over a
+     larger plane, a dataset outside MATLAB's `#refs#` store over one in
+     it. Each candidate plane must also look like an image
+     (`formats.image_like`): on 4 x 4 (or 2 x 2) block means of a centre
+     crop, each column replaced by its ranks, neighbouring pixels must
+     differ less than 0.9 times as much as random pixel pairs. White noise,
+     tables (columns of unrelated scales), sparse count matrices and
+     stacked signals come out near 1, images, scans and masks far below;
+     up to six candidates are tried before the file is `not_image_shaped`.
+     The variable used is recorded (`array_variable`, `array_shape`,
+     `neighbour_ratio`). A volume whose name suggests OCT (oct, bscan,
+     cube, volume, vol) of at most 256 MB also gives an en-face view (mean
+     along the depth axis, classified on its own, path ending `#enface`).
+     Pickled NumPy object arrays (`np.save` of a dict or a list of arrays,
+     which cannot be memory-mapped) are unpickled with an allow-list of the
+     NumPy reconstruction globals only, so no other callable can run; their
+     arrays are searched by dotted name. MAT v5 files whose variables
+     `whosmat` cannot list (a MATLAB object such as a table, string or
+     classdef in the file) are listed by the survey's own header reader;
+     structs and cells of files up to 256 MB are loaded and searched when no
+     plain variable is image like. MATLAB strings (HDF5 `MATLAB_class`
+     char) are never candidates. Only the chosen slice is read (h5py and
+     memory-mapped NumPy and Octave data slice lazily, strided when large).
+     Network parameters are never candidates: a
      dataset named like a layer parameter (kernel, bias, weight, gamma,
      beta, running_mean, moving_variance, embeddings, with an optional
      `:0`) is skipped, and an HDF5 that Keras wrote (root attribute
@@ -985,9 +1042,13 @@ accept):
      model_weights) is not searched at all. A file without such a dataset
      (model weights, tables) is reported as `not_image_shaped`, which does not count as a
      pixel file for the record status.
-   - Microscopy: CZI (`pylibCZIrw`, read at a zoom under the budget), LIF
-     (`readlif`), ND2 (`nd2`, lazily), OIB (`oiffile`), MRC (`mrcfile`,
-     memory-mapped): middle Z plane, first channel, time 0.
+   - Microscopy: CZI (`pylibCZIrw`, read at a zoom under the budget; when
+     it rejects the pixel type, such as Bgra32, or the scan is a line scan,
+     `czifile` composes the first scene's middle Z plane at the pyramid
+     level of at least 1024 px, BGR(A) turned to RGB, and a line scan
+     without a Y axis keeps Z, else T, as its rows), LIF (`readlif`), ND2
+     (`nd2`, lazily), OIB (`oiffile`), MRC (`mrcfile`, memory-mapped):
+     middle Z plane, first channel, time 0.
    - Vendor OCT: Heidelberg E2E, Topcon FDS and FDA (checked for the FOCT
      signature, since `.fds` is also the Fire Dynamics Simulator format)
      and Bioptigen OCT through `oct-converter`; Heidelberg VOL (HSF-OCT)
@@ -999,10 +1060,54 @@ accept):
      spectral file (mean spectrum removed, Hann window, FFT, log
      magnitude; no chirp correction). Heidelberg SDB has no open reader and
      is catalogued. `oct-converter` imports OpenCV; the survey extra
-     installs the headless build, which needs no libGL.
+     installs the headless build, which needs no libGL. The extensions
+     are shared with other formats and are checked by content first: a
+     `.vol` without the HSF-OCT signature that is an MRC volume (cryo-EM
+     subtomograms) goes to `mrcfile`, any other is `no_reader`; a `.oct`
+     that is a GNU Octave save file goes to the array reader.
    - Video: frames at 25, 50 and 75% of the duration (the ffmpeg bundled
      with `imageio-ffmpeg`), classified together: their probabilities are
-     averaged into one prediction (`n_frames_averaged`).
+     averaged into one prediction (`n_frames_averaged`). When the ffmpeg
+     binary cannot read the file, PyAV (`av`) seeks the same positions or,
+     without a usable duration, takes frames spread over the first 600; a
+     recording that stopped before its index (`moov`) was written but whose
+     `mdat` holds an Annex-B H.264 stream is decoded as raw H.264.
+   - Float rasters whose every value is NaN or nodata (below -1e30, the
+     GDAL default) are `blank`; a multi-band stack takes the first band that
+     holds a value.
+   - macOS resource forks (`__MACOSX/`, `._x.png`, `.DS_Store`) are never
+     registered as images in local and downloaded archives either
+     (`kind_counts["junk"]`), as they already were not in remote listings.
+
+   **Formats added for the Zenodo 30k rescoring.** The v2 rescoring left
+   212 records `images_unreadable`. Their unread files, sampled from Zenodo
+   and decoded again, came down to these causes (files over all 212):
+
+   | Format (as recorded) | Files (records) | Root cause | Fix |
+   |---|---|---|---|
+   | JPEG (`thumb*.jpeg`) | 250 (50) | S3 `AccessDenied` XML error pages of 243 bytes, stored in the records | `wrong_format` by content |
+   | MAT v5, MAT v7.3, HDF5, NPY, NPZ | 920 (51) | no image-shaped dataset: tables, spectra, Keras weights (85), signals; stacks sliced along the wrong axis, channel-first RGB, complex data, images inside structs and cells | stack axis rule, channels first, complex magnitude, struct and cell search, next candidate tried, `image_like` |
+   | NPY (pickled) | 222 (13) | object dtype (`np.save` of a dict) cannot be memory-mapped | allow-list unpickling |
+   | SVG | 225 (16) | resvg-py dpi 0: sizes in pt, mm or in became zero | dpi 96 |
+   | MAT (whosmat failed) | 117 (22) | a MATLAB object (trained network, table) in the file | own MAT v5 header reader (the objects themselves are not images) |
+   | MAT (not MAT v5) | 19 (3) | no MAT v5 header, read as MAT v4 | none (unknown layout) |
+   | ANALYZE (`.hdr`) | 63 (6) | BART k-space headers; their `.cfl` data was never fetched | BART reader, `.cfl` fetched next to its header |
+   | HDR | 50 (1) | ENVI headers read as Analyze | ENVI reader (1-line push-broom scans: `not_image_shaped`) |
+   | VOL | 50 (1) | cryo-EM subtomograms named `.vol`, not Heidelberg HSF-OCT | MRC by content, else `no_reader` |
+   | OCT | 24 (2) | GNU Octave save files named `.oct` | Octave reader (time series: `not_image_shaped`) |
+   | BMP, NII.GZ, NII | 37, 12, 1 (1) | git-annex links committed as text | `wrong_format` |
+   | PNG, GIF | 2, 1 (3) | git-lfs pointer, PDF, other content under an image name | `wrong_format` by content |
+   | NII (CIFTI-2) | 3 (1) | surface data, no voxel grid | `not_image_shaped` |
+   | JPG (iView) | 2 (1) | lossless 16-bit JPEG (SOF3) | imagecodecs |
+   | DICOM | 2 (1) | RT dose without file meta | transfer syntax from the detected encoding |
+   | PSD, MP4 | 1, 1 (2) | Pillow layer numbering; recording without an index | composite read; PyAV raw H.264 |
+   | blank | 69 (20) | constant frames, empty masks | none (genuinely blank) |
+   | oversize members | 1,633 | remote zip members over the 200 MB sampling cap | rerun with `--remote-max-member-mb 2048` and a per-record budget; larger members stay a documented skip |
+
+   Among records of other statuses the same causes also hit PSD (Pillow
+   numbers layers from 1, so seeking frame 0 failed on every PSD), CZI
+   (Bgra32, line scans), MP4 recordings without an index, GeoTIFFs of
+   nodata only and macOS resource forks in archives.
 
    Integer data deeper than 8 bits and floats are windowed between the 0.5
    and 99.5 percentiles (on at most 1M samples), except data with 256 or
@@ -1650,6 +1755,31 @@ CMDS_JSON as paths or text, the SetFit column label); two downloads with
 one base name; and the pipeline options. Each of these guards was
 mutation-checked.
 
+`tests/test_formats.py` covers the converters added for the Zenodo 30k
+rescoring, each on a synthetic fixture rebuilt from a real failing file
+(no data files in the repository): XML error pages, git-lfs pointers,
+git-annex links, PDFs, HTML and empty files under image, array and volume
+names (`wrong_format`, not pixel-bearing) while NRRD, MetaImage, Octave
+text, SVG and gzip content are never taken for placeholders; lossless
+16-bit, 12-bit and JPEG XL files under `.jpg`, and the size check before a
+lossless decode; the Photoshop composite; SVG sizes in pt, mm, in and cm
+and data URIs with parameters; pickled object arrays read with the
+allow-list (a pickle that would run code is refused and nothing runs, in
+`.npy` and `.npz`); complex and channel-first arrays; the stack axis rule;
+tables, signals and noise rejected while images, masks and speckled
+OCT-like scans pass (`image_like`), and the next candidate tried after a
+rejected one; MATLAB strings skipped; the OCT en-face view; the MAT v5
+header reader against `whosmat`, the fallback when `whosmat` fails, and
+structs and cells searched; Octave binary (struct, string, scalar) and
+text files; ENVI in all three interleaves, default bands and line scans;
+BART magnitude and strips; `.hdr` data companions and their top-level
+fetch; CIFTI; GDAL nodata blanks and the first band with values; DICOM
+without file meta and the stricter bare-DICOM sniff; MP4 recordings
+without an index; the CZI fallback (BGRA order, line scans) through a
+stand-in `czifile`; macOS resource forks in archives; the unread reason
+order; MRC and other content under `.vol`. Each of the 37 guards was
+mutation-checked: reverting it makes its test fail.
+
 ## Known limits
 
 - Remote zip sampling reads at most `--remote-cap` images per record, so
@@ -1682,6 +1812,16 @@ mutation-checked.
   streamed ones. A split set spread over several Zenodo records cannot be
   read. For example, ULS23 Part 5 (10057471) holds only `images.z12` to
   `.z20` of another split set, so it reports no usable images.
+- Remote zip members over `--remote-max-member-mb` are not sampled: they
+  are fetched whole or not at all. Reading only the bytes of one frame by
+  range (TIFF page offsets, HDF5 chunks, DICOM frame offsets) would need
+  the decoders to run while fetching; the pipeline's process role is
+  offline, and a sparse partial copy read later could decode zeros as
+  pixels without an error. Raise the cap (with a per-record budget)
+  instead. MAT v5 variables over 1 GiB have no partial read either.
+- MP4 recordings without an index whose `mdat` holds length-prefixed
+  (AVCC) H.264 cannot be decoded: their parameter sets were only in the
+  missing `moov`. Truncated or corrupt AVI / FLV files stay unreadable.
 - Vendor OCT containers (`.e2e`, `.fds`, `.fda`, `.vol`, `.sdb`) are
   counted and used as manufacturer hints but not decoded. The same goes for
   video, `.h5`, `.mat` and `.npy`.

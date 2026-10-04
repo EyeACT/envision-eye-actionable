@@ -53,7 +53,7 @@ from typing import Iterator
 from ..unpack import unpack_archive
 from .constants import (
     IMAGE_KINDS, PATH_KINDS, RAR_EXTS, SEVEN_ZIP_EXTS, SNIFF_BYTES, TAR_EXTS, ZIP_EXTS,
-    detect_ext, file_kind, nested_worth, sniff_kind, split_first, volume_companion,
+    detect_ext, file_kind, is_junk_name, nested_worth, sniff_kind, split_first, volume_companion,
 )
 
 try:                    # registers Deflate64 (method 9) with zipfile
@@ -72,7 +72,7 @@ UNRAR = shutil.which("unrar")
 _PY_ZIP_METHODS = {0, 8, 12, 14} | ({9} if _DEFLATE64 else set())
 DICM_MAGIC_OFFSET = 128
 # Names a volume header's data member can end with (constants.volume_companion)
-_COMPANION_SUFFIXES = (".raw", ".zraw", ".img", ".gz")
+_COMPANION_SUFFIXES = (".raw", ".zraw", ".img", ".gz", ".cfl", ".dat", ".bsq", ".bil", ".bip")
 # Image entries one record keeps in memory. Past this the walker only counts
 # (n_entries_over_cap): the sample (at most max_images) is drawn from the
 # first MAX_ENTRIES in listing order and the population counts stay exact.
@@ -128,6 +128,9 @@ class RecordWalker:
     # ------------------------------------------------------------------ add
     def add_file(self, path: Path, display: str, depth: int = 0):
         """Register a top-level (or decompressed) file."""
+        if is_junk_name(display.rsplit("!/", 1)[-1]):
+            self.kind_counts["junk"] += 1
+            return
         kind = file_kind(path.name)
         ext = detect_ext(path.name)
         if kind in ("noext", "other"):
@@ -205,6 +208,10 @@ class RecordWalker:
         kind = file_kind(name)
         ext = detect_ext(name)
         self.member_ext_counts[ext or "(none)"] += 1
+        if is_junk_name(name):
+            # macOS resource forks (__MACOSX/._x.png): never an image or archive
+            self.kind_counts["junk"] += 1
+            return
         if kind == "noext" and opener is not None and self._sniffed < self.noext_sniff_limit \
                 and 8 <= size < (64 << 20):
             self._sniffed += 1

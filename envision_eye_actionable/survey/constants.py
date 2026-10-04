@@ -80,7 +80,17 @@ VOLUME_EXTS = {".nii", ".nii.gz", ".nrrd", ".mha"}
 # stem (x.mhd + x.raw / x.zraw, Analyze x.hdr + x.img, detached x.nhdr +
 # x.raw): both files are fetched together and read as one volume.
 VOLUME_HEADER_EXTS = {".mhd", ".nhdr", ".hdr"}
-VOLUME_DATA_EXTS = {".raw", ".zraw", ".img"}
+# A .hdr is an Analyze header (data in x.img), an ENVI header (data in x.img,
+# x.dat, x.raw, x.bsq / .bil / .bip or x without an extension) or a BART
+# header (complex data in x.cfl): images.py tells them apart by content.
+VOLUME_DATA_EXTS = {".raw", ".zraw", ".img", ".cfl", ".bsq", ".bil", ".bip"}
+# Data file endings of each header kind, in the order they are looked for
+# ("" is the header's stem without an extension, as ENVI writes it).
+VOLUME_DATA_ORDER = {
+    ".hdr": (".img", ".cfl", ".dat", ".raw", ".bsq", ".bil", ".bip", ""),
+    ".mhd": (".raw", ".zraw", ".img", ".gz", ".raw.gz"),
+    ".nhdr": (".raw", ".zraw", ".img", ".gz", ".raw.gz"),
+}
 VOLUME_INVENTORY_ONLY_EXTS = VOLUME_HEADER_EXTS       # old name
 # Proprietary OCT / SLO containers: decoded where an open reader exists
 # (oct-converter: E2E, FDS, FDA, Bioptigen OCT; Heidelberg VOL and Thorlabs
@@ -285,8 +295,7 @@ def volume_companion(name: str, names) -> str | None:
         return None
     stem = name[: -len(ext)]
     lookup = {n.lower(): n for n in names}
-    order = (".img",) if ext == ".hdr" else (".raw", ".zraw", ".img", ".gz", ".raw.gz")
-    for data_ext in order:
+    for data_ext in VOLUME_DATA_ORDER[ext]:
         hit = lookup.get((stem + data_ext).lower())
         if hit is not None:
             return hit
@@ -297,15 +306,27 @@ def volume_header_of(name: str, names) -> str | None:
     """The header a volume data file belongs to (inverse of
     volume_companion), or None."""
     ext = detect_ext(name)
-    if ext not in VOLUME_DATA_EXTS:
+    if ext not in VOLUME_DATA_EXTS and ext not in (".dat", ""):
         return None
-    stem = name[: -len(ext)]
+    stem = name[: -len(ext)] if ext else name
     lookup = {n.lower(): n for n in names}
-    for hdr_ext in (".hdr",) if ext == ".img" else (".mhd", ".nhdr"):
+    for hdr_ext in [h for h, order in VOLUME_DATA_ORDER.items() if ext in order]:
         hit = lookup.get((stem + hdr_ext).lower())
         if hit is not None:
             return hit
     return None
+
+
+_JUNK_PREFIXES = ("__MACOSX/",)
+
+
+def is_junk_name(name: str) -> bool:
+    """macOS resource forks and metadata (__MACOSX/, ._x.png, .DS_Store):
+    never images, whatever their extension says."""
+    name = name.replace("\\", "/")
+    base = PurePosixPath(name).name
+    return name.startswith(_JUNK_PREFIXES) or "/__MACOSX/" in name or base.startswith("._") \
+        or base == ".DS_Store"
 
 
 # ---------------------------------------------------------------------------
@@ -334,10 +355,48 @@ def sniff_kind(head: bytes) -> tuple[str, str] | None:
         dib, = struct.unpack("<I", head[14:18])
         if dib in (12, 40, 52, 56, 64, 108, 124) and size >= 26:
             return "raster", ".bmp"
-    if len(head) >= 8 and head[:2] in (b"\x08\x00", b"\x02\x00"):
-        import struct
-        elem, = struct.unpack("<H", head[2:4])
-        vr = head[4:6]
-        if elem <= 0x0100 and (vr.isalpha() and vr.isupper() or struct.unpack("<I", head[4:8])[0] < 1024):
-            return "dicom", ".dcm"
+    if len(head) >= 8 and head[:2] in (b"\x08\x00", b"\x02\x00") and _bare_dicom(head):
+        return "dicom", ".dcm"
     return None
+
+
+# Value representations of DICOM explicit VR encoding.
+_DICOM_VRS = {b"AE", b"AS", b"AT", b"CS", b"DA", b"DS", b"DT", b"FL", b"FD", b"IS", b"LO", b"LT", b"OB", b"OD",
+              b"OF", b"OL", b"OV", b"OW", b"PN", b"SH", b"SL", b"SQ", b"SS", b"ST", b"SV", b"TM", b"UC", b"UI",
+              b"UL", b"UN", b"UR", b"US", b"UT", b"UV"}
+_DICOM_LONG_VRS = {b"OB", b"OD", b"OF", b"OL", b"OV", b"OW", b"SQ", b"UC", b"UN", b"UR", b"UT"}
+
+
+def _bare_dicom(head: bytes) -> bool:
+    """Preamble-less DICOM (little endian, group 0x0002 or 0x0008 first):
+    the first two data elements in ``head`` must parse, each with a known
+    value representation (explicit VR) or a length under 1024 (implicit
+    VR), in ascending tag order. One plausible element alone also matched
+    SQLite pages and other binary files that start with 08 00."""
+    import struct
+    pos, prev, n = 0, (-1, -1), 0
+    while n < 2 and pos + 8 <= len(head):
+        group, elem = struct.unpack("<HH", head[pos:pos + 4])
+        if group not in (0x0002, 0x0008) or (group, elem) <= prev or elem > 0x2000:
+            return False
+        vr = head[pos + 4:pos + 6]
+        if vr in _DICOM_VRS:
+            if vr in _DICOM_LONG_VRS:
+                if pos + 12 > len(head):
+                    break
+                length = struct.unpack("<I", head[pos + 8:pos + 12])[0]
+                pos += 12
+            else:
+                length = struct.unpack("<H", head[pos + 6:pos + 8])[0]
+                pos += 8
+        else:
+            length = struct.unpack("<I", head[pos + 4:pos + 8])[0]
+            pos += 8
+        if length > 1024:
+            return False
+        prev = (group, elem)
+        pos += length
+        n += 1
+    # every inconsistency returned False above; a second element past the
+    # sniffed bytes cannot be checked, so one parsed element is enough then
+    return n >= 1

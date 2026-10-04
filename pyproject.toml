@@ -72,7 +72,9 @@ survey = [
     "requests>=2.31",
     # LZW / JPEG / deflate TIFF variants that Pillow cannot open go through
     # tifffile, which needs imagecodecs for most compressions.
-    "imagecodecs>=2024.1",
+    # It also decodes what Pillow cannot (survey images.py fallback):
+    # lossless and 12-bit JPEG, JPEG XL, JPEG XR, odd BMP / PNG variants.
+    "imagecodecs>=2024.6",
     # Format conversion: compressed DICOM transfer syntaxes (JPEG lossless,
     # JPEG-LS, JPEG 2000), SVG rasterising (a wheel, no system cairo),
     # HEIC, video frames (bundled ffmpeg), Deflate64 zips, zstd tars, vendor
@@ -81,9 +83,13 @@ survey = [
     "pylibjpeg>=2.0",
     "pylibjpeg-libjpeg>=2.1",
     "pylibjpeg-openjpeg>=2.3",
-    "resvg-py>=0.2",
+    # 0.5: the dpi option (physical units such as width="504pt" render)
+    "resvg-py>=0.5",
     "pillow-heif>=0.16",
     "imageio-ffmpeg>=0.5",
+    # PyAV: video the ffmpeg binary cannot open (recordings without an
+    # index decoded as raw H.264), frames by seek or scan
+    "av>=12.0",
     "inflate64>=1.0",
     # Deflate64 members of local and downloaded zips (archives.py; inflate64
     # serves only the remote path)
@@ -93,6 +99,8 @@ survey = [
     "zstandard>=0.22",
     "opencv-python-headless>=4.8",
     "pylibCZIrw>=4.0",
+    # CZI pixel types and line scans pylibCZIrw rejects (scene API)
+    "czifile>=2026.8",
     "readlif>=0.6",
     "nd2>=0.10",
     "mrcfile>=1.5",
