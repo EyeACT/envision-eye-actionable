@@ -167,6 +167,7 @@ class SurveyConfig:
     role_recycle_gb: float = 4.0           # fetch / process: clean restart when own RSS + swap exceeds this (0: never)
     keep_dir: Path | None = None           # process: fetched files of records with an eye image are moved here
     keep_max_gb: float = 200.0             # keep dir size cap (0: none); past it records are not kept (kept false)
+    keep_skip_ids: list[str] = field(default_factory=list)  # process: never keep these records (kept false)
     refetch_ids: list[str] = field(default_factory=list)   # fetch: redo these finished pre-retention records
     keep_scratch: bool = False
     write_predictions: bool = True

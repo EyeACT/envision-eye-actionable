@@ -1843,6 +1843,35 @@ def test_keep_guards_refuse_without_deleting_kept_records(tmp_path, monkeypatch)
     assert ev.count("keep_refused") == 2 and ev.count("kept") == 1
 
 
+def test_keep_skip_ids_are_never_kept(tmp_path, monkeypatch):
+    from envision_eye_actionable.survey import keep, pipeline, runner
+    from envision_eye_actionable.survey.results import load_results
+    monkeypatch.setattr(runner, "OnnxClassifier", _OnnxStub)
+    meta = _write_records(tmp_path, {r: {"0.png": b"x"} for r in ("3301", "3302")})
+    kdir = tmp_path / "keep"
+    cfg = _cfg(tmp_path, meta, keep_dir=kdir, keep_max_gb=0, keep_skip_ids=["3301"],
+               spool_max_gb=0.001)
+    proc = pipeline.Processor(cfg)
+    for rid in ("3301", "3302"):
+        _eye_spool_record(proc.spool, rid, extra=False)
+        assert proc.process_one(rid) == "row"
+    rows = load_results(cfg.out_dir / "survey_results.jsonl")
+    assert rows["3301"]["kept"] is False and rows["3301"]["kept_reason"].startswith("--keep-skip-ids")
+    assert rows["3301"]["n_eye_images"] == 4 and not (kdir / "3301").exists()
+    assert proc.spool.state("3301") == "absent"
+    assert rows["3302"]["kept"] is True and (kdir / "3302").is_dir()
+    assert keep.refused_for_room(rows["3301"]) is False
+
+
+def test_cli_keep_skip_ids_reads_the_file(tmp_path, capsys):
+    from envision_eye_actionable.survey import cli
+    (tmp_path / "m.onnx").write_bytes(b"x")
+    with pytest.raises(SystemExit):
+        cli.main(["process", "--keep-skip-ids", str(tmp_path / "missing.txt"), "--model", str(tmp_path / "m.onnx"),
+                  "--spool-dir", str(tmp_path / "spool"), "--state-dir", str(tmp_path / "state")])
+    assert "--keep-skip-ids" in capsys.readouterr().err
+
+
 def test_keep_dir_must_be_its_own_and_on_the_spool_filesystem(tmp_path, monkeypatch):
     from envision_eye_actionable.survey import keep
     from envision_eye_actionable.survey.spool import Spool

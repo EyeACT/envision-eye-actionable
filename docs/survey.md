@@ -674,6 +674,7 @@ accept):
 | `--once`, `--exit-when-idle` | off | monitor: one snapshot; or stop when neither role runs |
 | `--keep-dir` | none | process: move the fetched files of records with an eye image here instead of deleting them |
 | `--keep-max-gb` | 200 | process: keep no new record past this size of the keep dir (0: no cap) |
+| `--keep-skip-ids` | none | process: ids never kept even when eye-positive (kept false), e.g. records eye-positive in an earlier run whose files are kept elsewhere |
 | `--refetch-keep-ids` | none | fetch: redo these pre-retention records first so their files reach the keep dir |
 
 ## How a record is processed

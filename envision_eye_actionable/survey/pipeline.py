@@ -802,7 +802,8 @@ class Processor:
                                  max_bytes=keep_max * 1e9 if keep_max else None,
                                  floor_bytes=cfg.disk_floor_gb * 1e9, spool_max_bytes=cfg.spool_max_gb * 1e9,
                                  status_path=self.state / STATUS_NAME, log_event=self.survey_event,
-                                 scratch_dir=cfg.scratch_dir, state_dir=self.state)
+                                 scratch_dir=cfg.scratch_dir, state_dir=self.state,
+                                 skip_ids=getattr(cfg, "keep_skip_ids", None))
             self.status.update(keep=self.keeper.summary())
             # records parked by an earlier consumer (moves that failed, or a
             # run without --keep-dir): their moves are tried again now

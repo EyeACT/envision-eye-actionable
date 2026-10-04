@@ -238,6 +238,11 @@ def _add_common(p):
                         "kept false with the reason; kept records are never deleted). Keeping also stops while "
                         "the free space with an empty spool would fall under --disk-floor-gb + --spool-max-gb "
                         "(default 200; 0: no size cap)")
+    g.add_argument("--keep-skip-ids", type=Path, default=None,
+                   help="process: record ids (one per line) never kept, even when eye-positive (their rows get "
+                        "kept false with the reason), e.g. records found eye-positive by an earlier run whose "
+                        "files are kept elsewhere, so the keep dir and its --keep-max-gb go to newly "
+                        "eye-positive records only")
     g.add_argument("--refetch-keep-ids", type=Path, default=None,
                    help="fetch: fetch and classify again the record ids in this file (one per line, e.g. from "
                         "keep-backfill-ids) whose last final row was written before --keep-dir existed, so "
@@ -451,6 +456,12 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"--refetch-keep-ids {args.refetch_keep_ids} not found")
         from .runner import read_ids_file
         refetch_ids = read_ids_file(args.refetch_keep_ids)
+    keep_skip_ids: list[str] = []
+    if args.keep_skip_ids is not None:
+        if not args.keep_skip_ids.is_file():
+            parser.error(f"--keep-skip-ids {args.keep_skip_ids} not found")
+        from .runner import read_ids_file
+        keep_skip_ids = read_ids_file(args.keep_skip_ids)
     if args.keep_dir is not None and args.cmd == "run":
         parser.error("--keep-dir works with the pipeline roles (pipeline, process), not run")
     ids = list(args.ids)
@@ -493,6 +504,7 @@ def main(argv: list[str] | None = None) -> int:
         max_role_restarts=args.max_role_restarts, restart_backoff_s=args.restart_backoff_s,
         role_recycle_gb=args.role_recycle_gb,
         keep_dir=args.keep_dir, keep_max_gb=args.keep_max_gb, refetch_ids=refetch_ids,
+        keep_skip_ids=keep_skip_ids,
     )
     if args.cmd == "run":
         stats = run_survey(cfg)

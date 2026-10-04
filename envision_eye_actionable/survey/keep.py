@@ -147,7 +147,7 @@ class Keeper:
     def __init__(self, keep_dir: Path, spool, downloads_dir: Path | None = None, out_dir: Path | None = None,
                  max_bytes: float | None = None, floor_bytes: float = 0, spool_max_bytes: float = 0,
                  status_path: Path | None = None, log_event=None, scratch_dir: Path | None = None,
-                 state_dir: Path | None = None):
+                 state_dir: Path | None = None, skip_ids=None):
         self.root = Path(keep_dir).resolve()
         self.spool = spool
         # the scratch dir matters most: the survey sweeps every all-digit
@@ -164,6 +164,9 @@ class Keeper:
             raise ValueError(f"keep dir {self.root} is not on the spool's filesystem ({spool.root}): files are "
                              "moved by rename, never copied")
         self.max_bytes = None if max_bytes is None or max_bytes <= 0 else int(max_bytes)
+        # records never kept here (for example eye-positive in an earlier run
+        # whose files are kept elsewhere): only newly eye-positive ones count
+        self.skip_ids = {str(r) for r in (skip_ids or ())}
         self.floor_bytes = int(floor_bytes or 0)
         self.spool_max_bytes = int(spool_max_bytes or 0)
         self.status_path = Path(status_path) if status_path else None
@@ -282,6 +285,8 @@ class Keeper:
         reason = ""
         if not n_eye:
             reason = "no eye image"
+        elif rid in self.skip_ids:
+            reason = "--keep-skip-ids: listed (not newly eye-positive)"
         elif self.max_bytes is not None and self.total_bytes - self.per_record.get(rid, 0) + need > self.max_bytes:
             reason = (f"--keep-max-gb {self.max_bytes / 1e9:g} reached (keep dir {self.total_bytes / 1e9:.1f} GB, "
                       f"record {need / 1e9:.2f} GB)")
