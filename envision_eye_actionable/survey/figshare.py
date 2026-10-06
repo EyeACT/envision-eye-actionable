@@ -49,8 +49,8 @@ retried with backoff too. The 429 cooldown and the per-minute budget use
 their own files in the shared state dir (figshare_not_before,
 figshare_requests), apart from Zenodo's.
 
-Token: with FIGSHARE_ACCESS_TOKEN in the environment (or --token-file),
-requests to api.figshare.com carry ``Authorization: token ...``. It is
+Token: FIGSHARE_ACCESS_TOKEN, else --token-file, else
+~/.config/envision-survey/figshare_token when it exists. Requests to api.figshare.com carry ``Authorization: token ...``. It is
 never sent to another host, never logged and registered for redaction.
 """
 
@@ -75,6 +75,8 @@ API = "https://api.figshare.com/v2"
 DATACITE_URL = "https://api.datacite.org/application/vnd.datacite.datacite+json/"
 LANDING = "https://figshare.com/articles/{}"
 TOKEN_ENV = "FIGSHARE_ACCESS_TOKEN"
+# Read when neither FIGSHARE_ACCESS_TOKEN nor --token-file is given and the file exists.
+DEFAULT_TOKEN_FILE = Path("~/.config/envision-survey/figshare_token")
 MAX_PER_MINUTE = 60
 MIN_INTERVAL = 1.0
 API_HOST = "api.figshare.com"
@@ -90,15 +92,20 @@ def record_id(article: int | str) -> str:
     return f"{FIGSHARE_PREFIX}{article_id(str(article))}"
 
 
-def load_token(token_file: Path | None = None) -> str | None:
+def load_token(token_file: Path | None = None, use_default: bool = True) -> str | None:
     """Figshare token from FIGSHARE_ACCESS_TOKEN, else the first line of
-    ``token_file``; None when there is none. Registered for redaction."""
+    ``token_file``, else (``use_default``) of DEFAULT_TOKEN_FILE when it
+    exists; None when there is none. An explicit ``token_file`` that cannot
+    be read is an error. Registered for redaction, never logged."""
     tok = os.environ.get(TOKEN_ENV, "").strip()
-    if not tok and token_file is not None:
+    path = Path(token_file).expanduser() if token_file is not None else None
+    if path is None and use_default and DEFAULT_TOKEN_FILE.expanduser().is_file():
+        path = DEFAULT_TOKEN_FILE.expanduser()
+    if not tok and path is not None:
         try:
-            tok = Path(token_file).expanduser().read_text(encoding="utf-8").strip().splitlines()[0].strip()
+            tok = path.read_text(encoding="utf-8").strip().splitlines()[0].strip()
         except (OSError, IndexError):
-            raise ValueError(f"cannot read the Figshare token file {token_file}") from None
+            raise ValueError(f"cannot read the Figshare token file {path}") from None
     if tok:
         register_secret(tok)
         return tok

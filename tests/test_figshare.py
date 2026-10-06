@@ -69,6 +69,14 @@ class _FakeFigshare:
         return _HttpResp(404)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_token(tmp_path, monkeypatch):
+    """Never pick up a token from the machine running the tests."""
+    from envision_eye_actionable.survey import figshare
+    monkeypatch.delenv("FIGSHARE_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(figshare, "DEFAULT_TOKEN_FILE", tmp_path / "no_such_dir" / "figshare_token")
+
+
 def _fclient(tmp_path, session=None, article_dir=None, **kw):
     from envision_eye_actionable.survey.figshare import FigshareClient
     c = FigshareClient(tmp_path / "cache", article_dir, min_interval=0, max_per_minute=None,
@@ -221,6 +229,17 @@ def test_token_goes_to_the_figshare_api_only_and_is_redacted(tmp_path, monkeypat
     assert figshare.load_token(None) is None
     with pytest.raises(ValueError):
         figshare.load_token(tmp_path / "missing")
+    default = tmp_path / "cfg" / "figshare_token"
+    default.parent.mkdir()
+    default.write_text("default-token-value\n", encoding="utf-8")
+    monkeypatch.setattr(figshare, "DEFAULT_TOKEN_FILE", default)
+    assert figshare.load_token(None) == "default-token-value"
+    assert figshare.load_token(None, use_default=False) is None
+    other = tmp_path / "t2"
+    other.write_text("explicit-token-value\n", encoding="utf-8")
+    assert figshare.load_token(other) == "explicit-token-value"
+    monkeypatch.setenv("FIGSHARE_ACCESS_TOKEN", "env-token-value")
+    assert figshare.load_token(other) == "env-token-value"
 
 
 def test_403_from_the_api_is_retried_and_from_files_is_not(tmp_path, monkeypatch):

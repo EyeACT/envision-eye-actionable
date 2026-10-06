@@ -1591,8 +1591,10 @@ code runs as it is.
   for Zenodo; a 403 from api.figshare.com (its abuse filter) is retried
   with backoff too. With a shared state dir the budget files are
   `figshare_requests` and `figshare_not_before`, apart from Zenodo's.
-- Token: `FIGSHARE_ACCESS_TOKEN` (or `--token-file`), sent as
-  `Authorization: token ...` to api.figshare.com only; never logged.
+- Token: `FIGSHARE_ACCESS_TOKEN`, else `--token-file`, else
+  `~/.config/envision-survey/figshare_token` when it exists; sent as
+  `Authorization: token ...` to api.figshare.com only, never logged. The
+  token does not change the pacing.
 - `enrich-access` and `partition` stay Zenodo only.
 
 ## Workbook sheets

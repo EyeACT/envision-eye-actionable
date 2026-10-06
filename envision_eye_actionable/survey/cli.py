@@ -114,9 +114,10 @@ def _add_common(p):
     p.add_argument("--series-min-mb", type=float, default=64.0,
                    help="file size from which --series-sample-k applies, in MB (default 64)")
     p.add_argument("--token-file", type=Path, default=None,
-                   help="file holding a Zenodo access token (one line; the ZENODO_TOKEN environment variable "
-                        "wins; default ~/.config/envision-survey/zenodo_token when it exists). Sent as a Bearer "
-                        "header to zenodo.org only, never logged, printed or written")
+                   help="file holding the source's access token (one line). Zenodo: ZENODO_TOKEN wins, default "
+                        "~/.config/envision-survey/zenodo_token, sent as a Bearer header to zenodo.org only. "
+                        "Figshare: FIGSHARE_ACCESS_TOKEN wins, default ~/.config/envision-survey/figshare_token, "
+                        "sent to api.figshare.com only. Never logged, printed or written")
     p.add_argument("--metadata-cache-dir", type=Path, default=None,
                    help="where record metadata fetched from Zenodo is cached (legacy/ and datacite/ "
                         "subdirs; default: <out-dir>/cache)")
