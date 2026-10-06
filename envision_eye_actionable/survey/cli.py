@@ -86,8 +86,14 @@ def _add_common(p):
     p.add_argument("--downloads-dir", type=Path, default=None,
                    help="existing downloads, used in place and never modified (default: ./data/downloads/zenodo; "
                         "an explicitly given dir must exist)")
-    p.add_argument("--metadata-dir", type=Path, default=Path("./data/metadata/zenodo"),
-                   help="discovery's raw Zenodo record JSONs (default: ./data/metadata/zenodo)")
+    p.add_argument("--metadata-dir", type=Path, default=None,
+                   help="discovery's raw record JSONs: Zenodo legacy record JSONs (default "
+                        "./data/metadata/zenodo), or Figshare article JSONs <article id>.json from the "
+                        "figshare_full pull (default ./data/metadata/figshare_full)")
+    p.add_argument("--source", choices=("auto", "zenodo", "figshare"), default="auto",
+                   help="repository the scrape lists (default auto: figshare when every scrape record has "
+                        "source figshare, zenodo when none has; a mixed scrape is refused). Figshare record "
+                        "ids are figshare-<article id> in every output")
     p.add_argument("--out-dir", type=Path, default=Path("./results/survey"),
                    help="results JSONL, CMDS JSON, predictions, caches (default: ./results/survey)")
     p.add_argument("--scratch-dir", type=Path, default=Path("./data/survey_scratch"),
@@ -157,11 +163,13 @@ def _add_common(p):
     p.add_argument("--max-depth", type=int, default=3, help="nested archive depth (default 3)")
     p.add_argument("--no-link-check", action="store_true", help="skip HTTP status checks of weblinks")
     p.add_argument("--link-interval", type=float, default=1.0, help="seconds between link checks")
-    p.add_argument("--zenodo-interval", type=float, default=0.5,
-                   help="minimum seconds between two Zenodo requests (default 0.5)")
-    p.add_argument("--rpm", "--zenodo-rpm", dest="zenodo_rpm", type=int, default=120,
-                   help="Zenodo requests per sliding minute for this process, all threads together (default "
-                        "120; Zenodo allows 133 per minute per IP and User-Agent, token or not). With "
+    p.add_argument("--zenodo-interval", "--request-interval", dest="zenodo_interval", type=float, default=None,
+                   help="minimum seconds between two requests to the source (default 0.5 for Zenodo, 1.0 for "
+                        "Figshare)")
+    p.add_argument("--rpm", "--zenodo-rpm", dest="zenodo_rpm", type=int, default=None,
+                   help="requests per sliding minute to the source for this process, all threads together "
+                        "(default 120 for Zenodo, which allows 133 per minute per IP and User-Agent, token or "
+                        "not; 60 for Figshare, which asks for about one request per second). With "
                         "--shared-state-dir (or --state-dir) the processes "
                         "together are also held to --shared-rpm, so --rpm only sets a process's share, "
                         "e.g. --rpm 90 for remote_zip and --rpm 20 for download")
@@ -171,9 +179,10 @@ def _add_common(p):
                         "under --shared-rpm (zenodo_requests, under a file lock), and each subtracts the "
                         "downloads the others have in flight on the same disk before checking "
                         "--disk-floor-gb (disk_reserve.*). Without it all three are per process")
-    p.add_argument("--shared-rpm", type=int, default=120,
-                   help="Zenodo requests per sliding minute of all the processes sharing --shared-state-dir "
-                        "(or --state-dir) together (default 120); ignored without either")
+    p.add_argument("--shared-rpm", type=int, default=None,
+                   help="requests per sliding minute of all the processes sharing --shared-state-dir "
+                        "(or --state-dir) together (default: as --rpm's default for the source); ignored "
+                        "without either")
     p.add_argument("--offline", action="store_true", help="no Zenodo API calls (cache and metadata dir only)")
     p.add_argument("--keep-scratch", action="store_true", help="do not delete the scratch dir (debugging)")
     p.add_argument("--no-predictions", action="store_true", help="skip per-image predictions files")
@@ -450,6 +459,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.token_file is not None and not args.token_file.expanduser().is_file():
         parser.error(f"--token-file {args.token_file} not found")
     downloads_dir = args.downloads_dir or Path("./data/downloads/zenodo")
+    from .sources import DEFAULT_METADATA_DIRS, DEFAULT_RATES, detect_source
+    source = args.source
+    if source == "auto":
+        try:
+            source = detect_source(args.scrape) if args.scrape.is_file() else "zenodo"
+        except (OSError, ValueError) as e:
+            parser.error(str(e))
+    rpm_default, interval_default = DEFAULT_RATES[source]
+    rpm = args.zenodo_rpm if args.zenodo_rpm is not None else rpm_default
+    shared_rpm = args.shared_rpm if args.shared_rpm is not None else rpm_default
+    interval = args.zenodo_interval if args.zenodo_interval is not None else interval_default
+    metadata_dir = args.metadata_dir if args.metadata_dir is not None else DEFAULT_METADATA_DIRS[source]
     refetch_ids: list[str] = []
     if args.refetch_keep_ids is not None:
         if not args.refetch_keep_ids.is_file():
@@ -475,10 +496,16 @@ def main(argv: list[str] | None = None) -> int:
         if not ids:
             # An empty id list would mean "every record": refuse instead.
             parser.error("--ids-file: no record ids in " + ", ".join(str(f) for f in args.ids_file))
+    if source == "figshare":
+        # bare article ids name the same records as figshare-<id>
+        from .zenodo import FIGSHARE_PREFIX
+        ids = [i if i.startswith(FIGSHARE_PREFIX) else FIGSHARE_PREFIX + i for i in ids]
+        refetch_ids = [i if i.startswith(FIGSHARE_PREFIX) else FIGSHARE_PREFIX + i for i in refetch_ids]
+        keep_skip_ids = [i if i.startswith(FIGSHARE_PREFIX) else FIGSHARE_PREFIX + i for i in keep_skip_ids]
     cfg = SurveyConfig(
         scrape_path=args.scrape, model_path=args.model or Path("model-not-needed.onnx"), out_dir=args.out_dir,
         downloads_dir=downloads_dir,
-        metadata_dir=args.metadata_dir if args.metadata_dir and args.metadata_dir.exists() else None,
+        metadata_dir=metadata_dir if metadata_dir and metadata_dir.exists() else None, source=source,
         scratch_dir=args.scratch_dir, max_images=args.max_images, remote_cap=args.remote_cap,
         max_download_gb=args.max_download_gb, remote_zip=not args.no_remote_zip,
         archive_probe=not args.no_archive_probe, archive_probe_mb=args.archive_probe_mb,
@@ -488,13 +515,13 @@ def main(argv: list[str] | None = None) -> int:
         remote_nested_max=args.remote_nested_max,
         remote_nested_gb=args.remote_nested_gb, remote_record_budget_gb=args.remote_record_budget_gb,
         remote_max_member_mb=args.remote_max_member_mb, min_eye_fraction=args.min_eye_fraction,
-        zenodo_per_minute=args.zenodo_rpm, shared_state_dir=args.shared_state_dir,
-        zenodo_shared_per_minute=args.shared_rpm, seed=args.seed,
+        zenodo_per_minute=rpm, shared_state_dir=args.shared_state_dir,
+        zenodo_shared_per_minute=shared_rpm, seed=args.seed,
         threshold=args.threshold, batch_size=args.batch_size, threads=args.threads,
         disk_floor_gb=args.disk_floor_gb, download_workers=args.download_workers,
         download_all=args.download_all, min_class_fraction=args.min_class_fraction,
         max_pixels=args.max_pixels, max_depth=args.max_depth, check_links=not args.no_link_check,
-        link_interval=args.link_interval, zenodo_interval=args.zenodo_interval,
+        link_interval=args.link_interval, zenodo_interval=interval,
         keep_scratch=args.keep_scratch, write_predictions=not args.no_predictions,
         offline=args.offline, ids=ids, limit=args.limit,
         retry_statuses=[s.strip() for s in args.retry_status.split(",") if s.strip()],

@@ -100,8 +100,22 @@ CACHE_MAX_BYTES = 64 << 20
 PREFETCH_MAX_BYTES = 8 << 20
 
 
-def file_url(record_id: str, key: str) -> str:
+def file_url(record_id: str, key: str, client=None) -> str:
+    """Download URL of a record's file: the source adapter's own URL when
+    ``client`` has one (a Figshare download_url), else Zenodo's
+    /files/<key>/content."""
+    resolve = getattr(client, "source_file_url", None) if client is not None else None
+    if resolve is not None:
+        url = resolve(record_id, key)
+        if url:
+            return url
     return f"{API}/{record_id}/files/{quote(key, safe='')}/content"
+
+
+def has_container_api(client) -> bool:
+    """Whether the source serves zip listings and members itself (Zenodo's
+    container endpoint). Without it zips are read by range requests only."""
+    return getattr(client, "has_container_api", True) is not False
 
 
 def container_url(record_id: str, key: str) -> str:
@@ -322,6 +336,17 @@ def list_zip(client: ZenodoClient, record_id: str, key: str, size: int) -> ZipLi
     """Members of a remote zip: container API first, range-read central
     directory when the listing is truncated or the API fails."""
     listing = ZipListing(key=key, source="container")
+    if not has_container_api(client):
+        listing.container_failed = True          # members go straight to range reads
+        try:
+            members = list_zip_by_range(client, record_id, key, size)
+        except Exception as e:  # noqa: BLE001 - a bad zip must not stop the record
+            listing.source = "range"
+            listing.error = f"range listing: {type(e).__name__}: {e}"[:300]
+            return listing
+        listing.source = "range"
+        listing.members = [m for m in members if not is_junk_member(m.name)]
+        return listing
     try:
         r = client.get(container_url(record_id, key), max_tries=3)
         try:
@@ -353,7 +378,7 @@ def list_zip(client: ZenodoClient, record_id: str, key: str, size: int) -> ZipLi
 
 def list_zip_by_range(client: ZenodoClient, record_id: str, key: str, size: int) -> list[Member]:
     import zipfile
-    fp = HttpRangeFile(client, file_url(record_id, key), size)
+    fp = HttpRangeFile(client, file_url(record_id, key, client), size)
     with zipfile.ZipFile(fp) as zf:
         return [_member(i.filename, i.file_size, i.compress_size, i.CRC)
                 for i in zf.infolist() if not i.is_dir() and not (i.flag_bits & 0x1)]
@@ -515,7 +540,7 @@ class RangeZips:
     def get(self, key: str, size: int):
         import zipfile
         if key not in self._open:
-            fp = HttpRangeFile(self.client, file_url(self.record_id, key), size, max_blocks=4)
+            fp = HttpRangeFile(self.client, file_url(self.record_id, key, self.client), size, max_blocks=4)
             self._open[key] = (fp, zipfile.ZipFile(fp))
         return self._open[key]
 
@@ -606,7 +631,11 @@ def fetch_member(client: ZenodoClient, record_id: str, lst: ZipListing, m: Membe
     can_range = bool(zip_size) and range_zips is not None
     compressible = (m.compressed_size > 0 and m.size >= COMPRESSED_PREFER_BYTES
                     and m.size >= COMPRESSED_PREFER_RATIO * m.compressed_size)
-    if lst.container_failed and can_range:
+    if not has_container_api(client):
+        err = "container: not offered by this source"
+        if not can_range:
+            return False, err + "; range: zip size unknown"
+    elif lst.container_failed and can_range:
         err = "container: skipped (container API failed for this zip)"
     elif compressible and can_range:
         err = "container: skipped (range read moves the compressed bytes)"
@@ -755,7 +784,7 @@ def _range_member(client: ZenodoClient, record_id: str, lst: ZipListing, m: Memb
     end = start + info.compress_size                       # exclusive
     if end > zip_size:
         raise RemoteError("member data runs past the end of the zip")
-    url = file_url(record_id, lst.key)
+    url = file_url(record_id, lst.key, client)
     # Deflate64 output per call is not bounded by a max_length: feed it
     # small chunks (a 64 KB chunk inflates to at most about 66 MB).
     chunk = (64 << 10) if info.compress_type == 9 else (1 << 20)

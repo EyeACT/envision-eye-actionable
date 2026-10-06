@@ -77,6 +77,7 @@ from .locks import LOCKING_AVAILABLE, DiskReservations, try_lock, unlock
 from .results import is_final, load_statuses
 from .spool import Spool, valid_record_id
 from .zenodo import ZenodoClient, load_scrape, load_token, record_files, redact
+from .sources import make_client
 
 PRODUCER_GONE_CHECKS = 3        # consumer: producer absent this many polls in a row -> drain and stop
 STATUS_EVERY_S = 15.0
@@ -329,9 +330,7 @@ def prefetch_metadata(cfg, threads: int = 2, progress_every: int = 500) -> dict:
     --metadata-cache-dir. Resumable (cached records cost nothing), rate
     limited like every other Zenodo request."""
     cache = cfg.metadata_cache_dir or (cfg.out_dir / "cache")
-    zen = ZenodoClient(cache, cfg.metadata_dir, min_interval=cfg.zenodo_interval, offline=cfg.offline,
-                       max_per_minute=cfg.zenodo_per_minute, shared_state_dir=cfg.state_dir or cfg.shared_state_dir,
-                       shared_per_minute=cfg.zenodo_shared_per_minute, token=load_token(cfg.token_file))
+    zen = make_client(cfg, shared_state_dir=cfg.state_dir or cfg.shared_state_dir)
     records = records_in_scope(cfg)
     stats = Counter()
     mismatch = []
@@ -383,10 +382,7 @@ class Producer:
         self.lock = RoleLock(self.state, "fetch", self.spool.root)
         self.status = RoleStatus(self.state, "fetch")
         self.events = self.state / "fetch_events.jsonl"
-        self.zenodo = ZenodoClient(cfg.metadata_cache_dir or (cfg.out_dir / "cache"), cfg.metadata_dir,
-                                   min_interval=cfg.zenodo_interval, offline=cfg.offline,
-                                   max_per_minute=cfg.zenodo_per_minute, shared_state_dir=self.state,
-                                   shared_per_minute=cfg.zenodo_shared_per_minute, token=load_token(cfg.token_file))
+        self.zenodo = make_client(cfg, shared_state_dir=self.state)
         self.disk = DiskReservations(self.state, self.spool.root)
         self._consumer_seen = time.monotonic()
         self._tl = threading.local()                  # .yieldable: this thread runs a triage job of the queue
@@ -787,6 +783,9 @@ class Processor:
         # manifest or an exception text never reaches the outputs).
         try:
             load_token(cfg.token_file)
+            if getattr(cfg, "source", "zenodo") == "figshare":
+                from .figshare import load_token as figshare_token
+                figshare_token(cfg.token_file)
         except ValueError:
             pass                                       # the producer, which needs it, reports that
         self.survey = Survey(cfg, role="process")

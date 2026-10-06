@@ -181,6 +181,13 @@ def _is_self(norm: str, ids: set[str]) -> bool:
     for i in ids:
         if not i:
             continue
+        if i.startswith("figshare-"):
+            a = re.escape(i[len("figshare-"):])
+            # the article page (any portal: x.figshare.com), its API URL, its DOI (any version)
+            if re.search(rf"figshare\.com/(articles/(.+/)?|ndownloader/articles/|v2/articles/){a}(?:$|[/?#])", norm) \
+                    or re.search(rf"10\.6084/m9\.figshare\.{a}(?:\.v\d+)?$", norm):
+                return True
+            continue
         if re.search(rf"zenodo\.org/(records?|deposit)/{i}(?:$|[/?#])", norm):
             return True
         if norm.endswith(f"10.5281/zenodo.{i}"):

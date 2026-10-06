@@ -51,7 +51,8 @@ from .dicom_map import ir_device_fields, mapping, modality_review
 from .results import load_results
 
 RECORD_COLUMNS: list[tuple[str, str]] = [
-    ("record_id", "Zenodo record id"),
+    ("record_id", "Record id (Zenodo record id, or figshare-<article id>)"),
+    ("source", "Repository"),
     ("doi", "DOI"),
     ("title", "Title"),
     ("url", "Landing page"),

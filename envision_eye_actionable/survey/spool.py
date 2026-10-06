@@ -39,6 +39,8 @@ import threading
 import time
 from pathlib import Path
 
+from .zenodo import is_record_id
+
 SPOOL_MARKER = ".envision_survey_spool"
 RECORDS = "records"
 REQUESTS = "requests"
@@ -69,7 +71,8 @@ def _fsync_write(path: Path, text: str):
 
 
 def valid_record_id(rid: str) -> bool:
-    return isinstance(rid, str) and rid.isdigit() and 0 < len(rid) <= 20
+    """A Zenodo record id or a namespaced Figshare id (figshare-<digits>)."""
+    return is_record_id(rid)
 
 
 class Spool:

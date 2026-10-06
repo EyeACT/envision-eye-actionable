@@ -578,7 +578,50 @@ def build_dataset_description(scrape: dict, legacy: dict | None, datacite: dict 
     if fmts:
         doc["format"] = fmts
         prov["format"] = "file extensions (Zenodo list + archive members)"
+    _retarget(doc, prov, repository_of(scrape), dc)
     return doc, prov
+
+
+def repository_of(scrape: dict) -> str:
+    """Display name of the repository holding a scrape record."""
+    if str(scrape.get("source_id") or "").startswith("figshare-") or             str(scrape.get("source") or "").lower() == "figshare":
+        return "Figshare"
+    return "Zenodo"
+
+
+def _retarget(doc: dict, prov: dict, repo: str, dc: dict):
+    """Name ``repo`` instead of Zenodo in the texts, placeholders and
+    provenance the builder writes (never in values taken from the record).
+    A no-op for Zenodo records, whose documents stay as they were."""
+    if repo == "Zenodo":
+        return
+    low = repo.lower()
+    synthesized = (dc or {}).get("_source") == "figshare_article"
+    for k, v in list(prov.items()):
+        if isinstance(v, str):
+            v = v.replace("Zenodo", repo).replace("zenodo", low)
+            if synthesized:
+                v = v.replace(f"{low}_datacite", f"{low}_article (no DataCite record)")
+            prov[k] = v
+    for field_, key in (("datasetDeIdentLevel", "deIdentDetails"), ("datasetConsent", "consentsDetails"),
+                        ("accessDetails", "description")):
+        d = doc.get(field_)
+        if isinstance(d, dict) and isinstance(d.get(key), str):
+            d[key] = d[key].replace("Zenodo", repo)
+    for t in doc.get("title") or []:
+        if prov.get("title", "").endswith("_legacy") and str(t.get("titleValue", "")).startswith("Zenodo record "):
+            t["titleValue"] = f"{repo} record " + t["titleValue"][len("Zenodo record "):]
+    for c in doc.get("creator") or []:
+        if c.get("creatorName") == "Zenodo depositor (not reported)":
+            c["creatorName"] = f"{repo} depositor (not reported)"
+    if (doc.get("publisher") or {}).get("publisherName") == "Zenodo" and not (dc or {}).get("publisher"):
+        doc["publisher"]["publisherName"] = repo
+    if (doc.get("managingOrganization") or {}).get("name") == "Zenodo":
+        doc["managingOrganization"]["name"] = repo
+    for r in doc.get("rights") or []:
+        ident = r.get("rightsIdentifier") or {}
+        if ident.get("rightsIdentifierScheme") == "Zenodo license id":
+            ident["rightsIdentifierScheme"] = f"{repo} license name"
 
 
 def _datacite_subject(s: dict) -> dict | None:
@@ -770,7 +813,8 @@ def build_structure_description(classes: dict, present: list[str], summary: dict
         "directoryList": dirs,
         "metadataFileList": [{
             "metadataFileName": "dataset_description.json",
-            "metadataFileDescription": "Dataset-level metadata harvested from the Zenodo record and mapped to "
+            "metadataFileDescription": f"Dataset-level metadata harvested from the "
+                                       f"{summary.get('repository') or 'Zenodo'} record and mapped to "
                                        "the AI-READI dataset_description schema.",
         }],
     }

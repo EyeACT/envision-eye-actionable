@@ -654,7 +654,7 @@ def probe_archive(client: ZenodoClient, record_id: str, key: str, size: int, *, 
     elif res.size <= min_bytes:
         res.note = f"small archive (at most {min_bytes >> 20} MB): downloaded without a probe"
         return res
-    url = file_url(record_id, key)
+    url = file_url(record_id, key, client)
     try:
         if res.fmt == "tar":
             _probe_tar(client, url, res, stream_bytes, max_requests)

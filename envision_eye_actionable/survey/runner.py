@@ -103,7 +103,8 @@ from .images import load_frame, preprocess
 from .locks import LOCKING_AVAILABLE, DiskReservations, try_lock
 from .results import is_final, load_results
 from .weblinks import LinkChecker, collect_links
-from .zenodo import ZenodoClient, load_scrape, load_token, record_files, redact, safe_filename
+from .sources import landing_url, make_client
+from .zenodo import is_record_id, load_scrape, record_files, record_source, redact, safe_filename
 
 RESULTS_NAME = "survey_results.jsonl"
 EVENTS_NAME = "survey_events.jsonl"
@@ -152,6 +153,7 @@ class SurveyConfig:
     zenodo_per_minute: int = 120
     shared_state_dir: Path | None = None   # 429 cooldown, request budget and disk reservations shared
     zenodo_shared_per_minute: int = 120    # combined requests per minute of the processes sharing that dir
+    source: str = "zenodo"                 # zenodo or figshare (sources.py); one source per run
     triage_cap: int = 50                   # images per sampled source on the triage pass (0: one pass)
     # fetch / process / pipeline (spool.py, pipeline.py)
     spool_dir: Path | None = None          # producer writes records here, the consumer deletes them
@@ -261,15 +263,12 @@ class Survey:
         self.events_path = cfg.out_dir / EVENTS_NAME
         _terminate_last_line(self.results_path)
         _terminate_last_line(self.events_path)
-        self.zenodo = ZenodoClient(cfg.metadata_cache_dir or (cfg.out_dir / "cache"), cfg.metadata_dir,
-                                   min_interval=cfg.zenodo_interval, offline=cfg.offline or role == "process",
-                                   max_per_minute=cfg.zenodo_per_minute,
-                                   shared_state_dir=cfg.shared_state_dir,
-                                   shared_per_minute=cfg.zenodo_shared_per_minute,
-                                   token=load_token(cfg.token_file) if role == "run" else None)
+        self.zenodo = make_client(cfg, shared_state_dir=cfg.shared_state_dir,
+                                  offline=cfg.offline or role == "process", with_token=role == "run")
         self.disk = DiskReservations(cfg.shared_state_dir, cfg.spool_dir if role == "process" else cfg.scratch_dir)
         self.links = LinkChecker(cfg.out_dir / "cache" / "link_status.json",
-                                 min_interval=cfg.link_interval, zenodo=self.zenodo) if cfg.check_links else None
+                                 min_interval=cfg.link_interval,
+                                 zenodo=self.zenodo if self.zenodo.source == "zenodo" else None)             if cfg.check_links else None
         self.clf = OnnxClassifier(cfg.model_path, threads=cfg.threads)
         self.model_info = {"model_file": cfg.model_path.name, **{
             k: self.clf.meta.get(k) for k in ("arch", "checkpoint", "checkpoint_sha256", "onnx_sha256",
@@ -412,8 +411,8 @@ class Survey:
     def _sweep_scratch(self):
         """Remove per-record scratch dirs left by killed runs.
 
-        Only sub-directories of ``scratch_dir/records`` named like a Zenodo
-        record id (all digits) are removed; _claim_scratch makes sure the
+        Only sub-directories of ``scratch_dir/records`` named like a record
+        id (all digits, or figshare-<digits>) are removed; _claim_scratch makes sure the
         scratch dir is the survey's own.
         """
         if self.cfg.keep_scratch or not self.records_scratch.is_dir():
@@ -421,7 +420,7 @@ class Survey:
         if not LOCKING_AVAILABLE:
             return        # another process may be using this scratch dir: nothing proves it is stale
         for p in self.records_scratch.iterdir():
-            if p.name.isdigit() and p.is_dir() and not p.is_symlink():
+            if is_record_id(p.name) and p.is_dir() and not p.is_symlink():
                 shutil.rmtree(p, ignore_errors=True)
                 _log_event(self.events_path, {"event": "stale_scratch_removed", "path": str(p)})
 
@@ -661,7 +660,8 @@ class Survey:
             "record_id": rec["source_id"],
             "doi": rec.get("doi"),
             "title": rec.get("title"),
-            "url": rec.get("url") or f"https://zenodo.org/records/{rec['source_id']}",
+            "url": rec.get("url") or landing_url(rec["source_id"]),
+            "source": record_source(rec["source_id"]),
             "license": rec.get("license"),
             "access_type": rec.get("access_type"),
             "size_mb": rec.get("size_mb"),
@@ -1234,6 +1234,7 @@ class Survey:
             "dicom_classes": dicom_classes,
             "formats": sorted((row.get("image_ext_counts") or {}).keys()),
             "review_note": row.get("modality_review_flags") if present else "",
+            "repository": cmds_mod.repository_of(rec),
         })
         out = self.cfg.out_dir / "cmds" / rec["source_id"]
         out.mkdir(parents=True, exist_ok=True)

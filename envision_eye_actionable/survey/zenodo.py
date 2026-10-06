@@ -228,13 +228,44 @@ def load_scrape(path: Path) -> list[dict]:
         sid = str(rec.get("source_id") or rec.get("id") or "").strip()
         if not sid:
             continue
+        if str(rec.get("source") or "").lower() == "figshare" and not sid.startswith(FIGSHARE_PREFIX):
+            # Figshare article ids and Zenodo record ids are both plain
+            # integers and can collide: Figshare records are namespaced.
+            rec["figshare_id"] = sid
+            sid = FIGSHARE_PREFIX + sid
         rec["source_id"] = sid
         out.append(rec)
     return out
 
 
+FIGSHARE_PREFIX = "figshare-"
+
+
+def record_source(record_id: str) -> str:
+    """'figshare' for a namespaced Figshare id, else 'zenodo'."""
+    return "figshare" if str(record_id).startswith(FIGSHARE_PREFIX) else "zenodo"
+
+
+def is_record_id(rid) -> bool:
+    """A Zenodo record id (digits) or a namespaced Figshare id
+    (figshare-<digits>), at most 20 digits: safe as a directory name."""
+    if not isinstance(rid, str):
+        return False
+    digits = rid[len(FIGSHARE_PREFIX):] if rid.startswith(FIGSHARE_PREFIX) else rid
+    return digits.isdigit() and digits.isascii() and 0 < len(digits) <= 20
+
+
 class ZenodoClient:
-    """Throttled, caching client for Zenodo record metadata."""
+    """Throttled, caching client for Zenodo record metadata.
+
+    Source adapters (figshare.FigshareClient) subclass it and override the
+    class attributes below plus legacy(), datacite() and source_file_url()."""
+
+    source = "zenodo"
+    has_container_api = True                    # zip listings via /files/<key>/container
+    retry_statuses = RETRY_STATUSES
+    cooldown_name = SHARED_COOLDOWN_NAME
+    requests_name = SHARED_REQUESTS_NAME
 
     def __init__(
         self,
@@ -269,9 +300,9 @@ class ZenodoClient:
         self.shared_per_minute = shared_per_minute
         if shared_state_dir is not None:
             Path(shared_state_dir).mkdir(parents=True, exist_ok=True)
-            self._shared_file = Path(shared_state_dir) / SHARED_COOLDOWN_NAME
+            self._shared_file = Path(shared_state_dir) / self.cooldown_name
             if shared_per_minute:
-                self._requests_file = Path(shared_state_dir) / SHARED_REQUESTS_NAME
+                self._requests_file = Path(shared_state_dir) / self.requests_name
         (cache_dir / "legacy").mkdir(parents=True, exist_ok=True)
         (cache_dir / "datacite").mkdir(parents=True, exist_ok=True)
 
@@ -431,7 +462,7 @@ class ZenodoClient:
                     return r.json()
                 except ValueError:
                     return None
-            if r.status_code in (429, 500, 502, 503, 504):
+            if self._retryable(r.status_code, url):
                 sleep = retry_after_seconds(r.headers.get("Retry-After"), delay, r.status_code)
                 logger.warning("GET %s -> %d, backing off %.0fs", url, r.status_code, sleep)
                 if r.status_code == 429:
@@ -472,7 +503,7 @@ class ZenodoClient:
             status = r.status_code
             retry_after = r.headers.get("Retry-After")
             r.close()
-            if status in RETRY_STATUSES:
+            if self._retryable(status, url):
                 sleep = retry_after_seconds(retry_after, delay, status)
                 last = f"HTTP {status}"
                 logger.warning("GET %s -> %d, backing off %.0fs", url, status, sleep)
@@ -485,7 +516,16 @@ class ZenodoClient:
             raise RemoteError(f"HTTP {status}", status)
         raise RemoteError(f"gave up after {max_tries} tries ({last})", status)
 
+    def _retryable(self, status: int, url: str) -> bool:
+        """A status worth retrying with backoff (429 and 5xx here)."""
+        return status in self.retry_statuses
+
     # -- Records ----------------------------------------------------------
+    def source_file_url(self, record_id: str, key: str) -> str | None:
+        """Download URL of one file of a record (None: use the Zenodo
+        /files/<key>/content URL)."""
+        return None
+
     def legacy(self, record_id: str) -> dict | None:
         """Legacy record JSON: discovery metadata dir, then cache, then API."""
         if self.metadata_dir:

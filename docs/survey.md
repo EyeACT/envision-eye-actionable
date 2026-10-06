@@ -1551,6 +1551,50 @@ the files open for that account on the website and for API requests made
 with a personal access token of the same account (`--token-file`), so a
 later survey run with that token reads them.
 
+## Figshare records (`--source figshare`)
+
+The same pipeline surveys a Figshare scrape (envision-discovery
+`envision/scrapers/figshare_full.py`: one JSON list of articles with
+`source: figshare` and their file listings, plus the article JSONs in
+`data/metadata/figshare_full/<article id>.json`). Nothing is forked:
+`survey/figshare.py` turns each article into the two documents the
+pipeline reads for a Zenodo record (a legacy record JSON and a DataCite
+JSON), and the fetch, probe, remote zip, classify, CMDS, weblink and keep
+code runs as it is.
+
+- Record ids: `figshare-<article id>` in rows, `cmds/`, the spool and the
+  keep dir, so they never collide with Zenodo ids. Rows have
+  `source: figshare`. `--ids` takes either form.
+- Source: `--source auto` (default) picks Figshare when every scrape record
+  has `source: figshare`; a scrape mixing both sources is refused. Survey
+  each source into its own out dir and merge the workbooks with
+  `--results-dir`.
+- Metadata: the article JSON from `--metadata-dir` (default
+  `./data/metadata/figshare_full`), else `GET /v2/articles/<id>` (cached in
+  `<cache>/figshare/`). DataCite JSON for the article DOI from
+  `api.datacite.org` (the same document Zenodo serves); when DataCite has no
+  record, one is built from the article and the CMDS provenance says
+  `figshare_article (no DataCite record)`. CMDS texts and provenance name
+  Figshare instead of Zenodo.
+- Access: confidential (access_right closed), embargoed (article or file
+  embargo) and download-disabled (restricted) articles get no file list and
+  status `restricted`, as for Zenodo. A metadata-only record is open with no
+  files (`no_files`). Link-only files are never downloaded; their URLs, and
+  the article's related materials, go to the weblink catalogue.
+- Files: `download_url` (ndownloader.figshare.com) redirects to a signed S3
+  URL and Range requests work through the redirect, so archive probes, zip
+  central directories and member range reads work as for Zenodo. Figshare
+  has no container API: zips are read by range requests only.
+- Rate limits: Figshare publishes no number and sends no rate limit
+  headers. Defaults are `--rpm 60` and 1.0 s between requests, every request
+  counted (API, DataCite, downloads, range reads). 429 and 5xx back off as
+  for Zenodo; a 403 from api.figshare.com (its abuse filter) is retried
+  with backoff too. With a shared state dir the budget files are
+  `figshare_requests` and `figshare_not_before`, apart from Zenodo's.
+- Token: `FIGSHARE_ACCESS_TOKEN` (or `--token-file`), sent as
+  `Authorization: token ...` to api.figshare.com only; never logged.
+- `enrich-access` and `partition` stay Zenodo only.
+
 ## Workbook sheets
 
 | Sheet | Content |
